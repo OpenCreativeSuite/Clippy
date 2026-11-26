@@ -1,0 +1,44 @@
+name: Build Clippy
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Clippy
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install CSX tool
+        run: dotnet tool install --global CSX.CliTool --version 1.0.4
+
+      - name: Install Donkeh tool
+        run: dotnet tool install --global Donkeh.CliTool
+
+      - name: Transform CSX sources
+        run: csx build --configuration Release
+
+      - name: Inspect the project with Donkeh
+        run: donkeh inspect project --json
+
+      - name: Build
+        run: >
+          dotnet build Clippy.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained false
+          -p:DebugType=None
+          -p:DebugSymbols=false

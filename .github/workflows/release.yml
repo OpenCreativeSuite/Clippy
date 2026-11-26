@@ -1,0 +1,144 @@
+name: Build and release Clippy
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.0 (blank uses the newest tag)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the tag to build
+        id: tag
+        shell: bash
+        run: |
+          tag=""
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          fi
+
+          if [[ -z "$tag" ]]; then
+            echo "No release tag found. Push a v* tag or supply one manually."
+          else
+            echo "Building release $tag"
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Windows x64
+    needs: resolve
+    if: needs.resolve.outputs.tag != ''
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install CSX tool
+        run: dotnet tool install --global CSX.CliTool --version 1.0.4
+
+      - name: Install Donkeh tool
+        run: dotnet tool install --global Donkeh.CliTool
+
+      - name: Transform CSX sources
+        run: csx build --configuration Release
+
+      - name: Inspect the project with Donkeh
+        run: donkeh inspect project --json
+
+      - name: Build runtime artifacts
+        # Package the runtime-specific build output directly. Never produce a
+        # single-file executable.
+        run: >
+          dotnet build Clippy.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          --output build-artifacts/win-x64
+          -p:DebugType=None
+          -p:DebugSymbols=false
+
+      - name: Verify folder output
+        shell: pwsh
+        run: |
+          $output = "build-artifacts/win-x64"
+
+          if (-not (Test-Path "$output/Clippy.exe")) {
+            throw "Expected the runtime build output to contain Clippy.exe."
+          }
+
+          Get-ChildItem $output | Select-Object Name, Length
+
+      - name: Package for Windows
+        shell: pwsh
+        run: Compress-Archive -Path "build-artifacts/win-x64/*" -DestinationPath "Clippy-win-x64.zip" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Clippy-win-x64
+          path: Clippy-win-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish latest release
+    needs: [resolve, build]
+    if: needs.resolve.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all builds
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -lh dist
+
+      - name: Create or update the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: Clippy ${{ needs.resolve.outputs.tag }}
+          files: dist/*
+          overwrite_files: true
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          make_latest: true
