@@ -1,0 +1,586 @@
+﻿using Donkeh.UILab;
+using Donkeh.Windowing;
+using Clippy.Ui;
+
+namespace Clippy.Ui;
+
+public sealed class WorkspaceView : Component
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var entry = session.ActiveComponent;
+        var propsAvailable = entry?.Data is not null && PropertyPlan.Build(entry).Items.Count > 0;
+
+        return
+            <section className="workspace">
+                <div className="workspace-top">
+                    <button className="back-btn" onClick={() => session.CloseWorkspace()}>
+                        <span className="fa back-glyph">{Icons.ChevronLeft}</span>
+                        <span>Browser</span>
+                    </button>
+                    <div className="workspace-title">
+                        <span className="workspace-name">{entry?.Name ?? "Workspace"}</span>
+                        {Ui.Maybe(entry is not null,
+                            <span className="workspace-sub mono">{ShortUrl(entry?.SourceUrl ?? "")}</span>)}
+                    </div>
+                    <div className="format-tabs">
+                        {FormatTab(OutputFormat.React, "React", "JSX", Icons.Code, session)}
+                        {FormatTab(OutputFormat.Csx, "Donkeh", "CSX", Icons.Cube, session)}
+                        {FormatTab(OutputFormat.Html, "HTML", "HTML", Icons.FileCode, session)}
+                    </div>
+                    <div className="workspace-top-actions">
+                        <button className={"chip-toggle" + (entry?.ExposeProperties == true ? " is-active" : "")}
+                                title={propsAvailable ? "Expose content properties" : "No text, image or link values to expose"}
+                                disabled={!propsAvailable}
+                                onClick={() => session.SetExposeProperties(entry?.ExposeProperties != true)}>
+                            <span className="fa">{Icons.Sliders}</span>
+                            <span>Props</span>
+                        </button>
+                        <button className="chip-toggle is-active"
+                                title="Toggle clean or faithful extraction"
+                                onClick={() => session.SetExtractionMode(entry?.Mode == ExtractionMode.Clean ? ExtractionMode.Faithful : ExtractionMode.Clean)}>
+                            <span className="fa">{Icons.LayerGroup}</span>
+                            <span>{entry?.Mode == ExtractionMode.Clean ? "Clean" : "Faithful"}</span>
+                        </button>
+                        <button className={"chip-toggle" + (session.CompareOpen ? " is-active" : "")}
+                                title="Compare original and extracted"
+                                onClick={() => session.ToggleCompare()}>
+                            <span className="fa">{Icons.Clone}</span>
+                            <span>Compare</span>
+                        </button>
+                        <button className="export-top" onClick={() => session.ExportActive(session.ActiveFormat, allFormats: false)}>
+                            <span className="fa">{Icons.Download}</span>
+                            <span>Export {FormatShort(session.ActiveFormat)}</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div className="workspace-body">
+                    <WorkspaceSidebar />
+                    <WorkspacePreview />
+                    <WorkspaceEditor />
+                </div>
+            </section>;
+    }
+
+    private static Node FormatTab(OutputFormat format, string label, string shortName, string glyph, AppSession session)
+    {
+        var active = session.ActiveFormat == format;
+        return
+            <button className={"format-tab" + (active ? " is-active" : "")} onClick={() => session.SetFormat(format)}>
+                <span className="fa">{glyph}</span>
+                <span className="format-tab-label">{label}</span>
+                <span className="format-tab-short">{shortName}</span>
+            </button>;
+    }
+
+    private static string FormatShort(OutputFormat format) => format switch
+    {
+        OutputFormat.React => "JSX",
+        OutputFormat.Csx => "CSX",
+        OutputFormat.Html => "HTML",
+        _ => "HTML"
+    };
+
+    private static string ShortUrl(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return "captured element";
+        return url.Length > 52 ? url[..49] + "…" : url;
+    }
+}
+
+public sealed class WorkspaceSidebar : Component
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var entry = session.ActiveComponent;
+        var ready = session.Components.Where(c => c.IsReady).OrderBy(c => c.Order).ToList();
+
+        return
+            <aside className="workspace-side">
+                <div className="wside-section components">
+                    <div className="wside-head">
+                        <span className="sidebar-eyebrow">Components</span>
+                        <span className="sidebar-count">{ready.Count}</span>
+                    </div>
+                    <div className="wside-list">
+                        {ready.Count == 0
+                            ? <div className="muted small">No ready components.</div>
+                            : Ui.List(ready, item =>
+                                <button
+                                    className={"wside-item" + (item.Id == entry?.Id ? " is-active" : "")}
+                                    onClick={() => session.OpenWorkspace(item.Id)}>
+                                    <span className="wside-index">{item.Order + 1}</span>
+                                    <span className="wside-name">{item.Name}</span>
+                                    {Ui.Maybe(item.WarningCount > 0, <span className="wside-state fa">{Icons.Warning}</span>)}
+                                </button> )}
+                    </div>
+                </div>
+
+                {entry?.Data is not null
+                    ? <div className="fragment">
+                        <div className="wside-section grow">
+                            <div className="wside-head">
+                                <span className="sidebar-eyebrow">Assets</span>
+                                <span className="sidebar-count">{entry.Assets.Count}</span>
+                            </div>
+                            <div className="wside-assets">
+                                {entry.Assets.Count == 0
+                                    ? <div className="muted small">No external assets.</div>
+                                    : Ui.List(entry.Assets, asset =>
+                                        <div className="wside-asset" key={asset.Url} title={asset.FileName ?? asset.Url}>
+                                            <span className={"asset-kind tone-" + (asset.LocalPath is null ? "error" : "ok")}>{asset.Kind}</span>
+                                            <span className="mono truncate">{asset.FileName ?? asset.Url}</span>
+                                            <span className="asset-size">{asset.Size > 0 ? FormatBytes(asset.Size) : ""}</span>
+                                        </div> )}
+                            </div>
+                        </div>
+                        <div className="wside-facts">
+                            <div><b>{entry.Data.NodeCount}</b> elements</div>
+                            <div><b>{entry.Rules.Count}</b> rules</div>
+                            <div><b>{entry.MediaRuleCount}</b> responsive</div>
+                            <div><b>{entry.ViewportWidth} × {entry.ViewportHeight}</b> captured</div>
+                        </div>
+                      </div>
+                    : null}
+            </aside>;
+    }
+
+    private static string FormatBytes(long bytes) => bytes switch
+    {
+        < 1024 => bytes + " B",
+        < 1024 * 1024 => (bytes / 1024.0).ToString("0.#") + " KB",
+        _ => (bytes / (1024.0 * 1024.0)).ToString("0.#") + " MB"
+    };
+}
+
+public sealed class WorkspacePreview : Component
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var entry = session.ActiveComponent;
+        var (customWidth, setCustomWidth) = State(session.PreviewWidth.ToString());
+        var (customHeight, setCustomHeight) = State(session.PreviewHeight.ToString());
+
+        Effect(() =>
+        {
+            setCustomWidth(session.PreviewWidth.ToString());
+            setCustomHeight(session.PreviewHeight.ToString());
+        }, [session.PreviewPreset, session.PreviewWidth, session.PreviewHeight]);
+
+        var scale = session.PreviewScale;
+        var width = session.PreviewWidth;
+        var height = session.PreviewHeight;
+        var frameWidth = Math.Round(width * scale);
+        var frameHeight = Math.Round(height * scale);
+        var scaleStyle = $"width:{frameWidth}px;height:{frameHeight}px;";
+
+        return
+            <section className="preview-pane">
+                <div className="preview-toolbar">
+                    <div className="segmented">
+                        {Preset("Mobile", "390", Icons.Mobile, session)}
+                        {Preset("Tablet", "768", Icons.Tablet, session)}
+                        {Preset("Desktop", "1280", Icons.Desktop, session)}
+                    </div>
+                    <div className="custom-size">
+                        <input className="size-input" value={customWidth} onInput={setCustomWidth} />
+                        <span className="muted">×</span>
+                        <input className="size-input" value={customHeight} onInput={setCustomHeight} />
+                        <button className="mini-btn" title="Apply size" onClick={() =>
+                        {
+                            if (int.TryParse(customWidth, out var w) && int.TryParse(customHeight, out var h))
+                                session.SetCustomViewport(w, h);
+                        }}><span className="fa">{Icons.Check}</span></button>
+                    </div>
+                    <div className="scale-cluster">
+                        <button className="mini-btn" title="Smaller preview" onClick={() => session.SetPreviewScale(session.PreviewScale - 0.05)}><span className="fa">{Icons.Minus}</span></button>
+                        <span className="scale-label">{Math.Round(session.PreviewScale * 100)}%</span>
+                        <button className="mini-btn" title="Larger preview" onClick={() => session.SetPreviewScale(session.PreviewScale + 0.05)}><span className="fa">{Icons.Plus}</span></button>
+                    </div>
+                    <button className="mini-btn accent" title="Rebuild preview" onClick={() => session.RefreshPreviewNow()}><span className="fa">{Icons.ArrowsRotate}</span></button>
+                </div>
+
+                <div className="preview-canvas">
+                    {session.CompareOpen
+                        ? <CompareSplit Width={width} Height={height} Scale={scale} />
+                        : <div className="preview-center">
+                            <div className="preview-frame" Attributes={new Dictionary<string, string>
+                            {
+                                ["style"] = $"width:{frameWidth}px;height:{frameHeight}px;"
+                            }}>
+                                <div className="preview-scale" Attributes={new Dictionary<string, string>
+                                {
+                                    ["style"] = scaleStyle
+                                }}>
+                                    {PreviewHost(session)}
+                                </div>
+                            </div>
+                            <div className="preview-caption">
+                                <span>{session.ActiveFormat.ToString()} preview</span>
+                                <span className="mono">{width} × {height}</span>
+                                <span className="muted">isolated · local assets</span>
+                            </div>
+                          </div>}
+                </div>
+
+                        <div className="preview-foot">
+                            <div className="muted small">
+                                Preview uses the recovered rules and local assets.
+                            </div>
+                        </div>
+            </section>;
+    }
+
+    private static Node Preset(string name, string width, string glyph, AppSession session)
+    {
+        var active = session.PreviewPreset == name;
+        return
+            <button className={"segment" + (active ? " is-active" : "")} onClick={() => session.SetPreviewPreset(name)}>
+                <span className="fa">{glyph}</span>
+                <span>{name}</span><span className="segment-meta">{width}</span>
+            </button>;
+    }
+
+    public static Node PreviewHost(AppSession session)
+    {
+        var src = session.PreviewUrl;
+        if (string.IsNullOrEmpty(src))
+            return Ui.Empty("Building preview", "The extracted component will appear here.", Icons.TableColumns);
+        return _.H("webview", new WebViewProps
+        {
+            Src = src,
+            ClassName = "preview-webview",
+            OnReady = view => session.AttachPreviewView(view)
+        });
+    }
+}
+
+public sealed class CompareSplitProps : Props
+{
+    public int Width { get; init; }
+    public int Height { get; init; }
+    public double Scale { get; init; }
+}
+
+public sealed class CompareSplit : Component<CompareSplitProps>
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var entry = session.ActiveComponent;
+        var width = Props.Width;
+        var height = Props.Height;
+        var scale = Math.Max(0.2, Math.Min(Props.Scale * 0.55, 0.7));
+
+        return
+            <div className="compare-split">
+                <div className="compare-column">
+                    <div className="compare-label"><span className="dot tone-live"></span> Original page</div>
+                    <div className="preview-frame" Attributes={new Dictionary<string, string>
+                    {
+                        ["style"] = $"width:{Math.Round(width * scale)}px;height:{Math.Round(height * scale)}px;"
+                    }}>
+                        <div className="preview-scale" Attributes={new Dictionary<string, string>
+                        {
+                            ["style"] = $"width:{Math.Round(width * scale)}px;height:{Math.Round(height * scale)}px;"
+                        }}>
+                            {entry is not null && !string.IsNullOrEmpty(entry.SourceUrl)
+                                ? _.H("webview", new WebViewProps
+                                {
+                                    Src = entry.SourceUrl,
+                                    ClassName = "compare-webview",
+                                    OnReady = view => session.AttachCompareView(view, scale)
+                                })
+                                : Ui.Empty("No source", "The original page URL is not available.", Icons.Circle)}
+                        </div>
+                    </div>
+                </div>
+                <div className="compare-column">
+                    <div className="compare-label"><span className="dot tone-ok"></span> Extracted</div>
+                    <div className="preview-frame" Attributes={new Dictionary<string, string>
+                    {
+                        ["style"] = $"width:{Math.Round(width * scale)}px;height:{Math.Round(height * scale)}px;"
+                    }}>
+                        <div className="preview-scale" Attributes={new Dictionary<string, string>
+                        {
+                            ["style"] = $"width:{Math.Round(width * scale)}px;height:{Math.Round(height * scale)}px;"
+                        }}>
+                            {WorkspacePreview.PreviewHost(session)}
+                        </div>
+                    </div>
+                </div>
+            </div>;
+    }
+}
+
+public sealed class WorkspaceEditor : Component
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var entry = session.ActiveComponent;
+        if (entry is null)
+            return <section className="editor-pane">{Ui.Empty("No component", "Open a captured component to edit it.", Icons.TableColumns)}</section>;
+
+        var tab = session.WorkspaceTab;
+        return
+            <section className="editor-pane">
+                <div className="editor-tabs">
+                    {EditorTab("code", "Component", Icons.FileCode, session)}
+                    {EditorTab("css", "CSS" + (entry.CssEdited ? " •" : ""), Icons.Palette, session)}
+                    {EditorTab("rules", "Rules", Icons.ListUl, session)}
+                    {EditorTab("export", "Export", Icons.Download, session)}
+                </div>
+
+                {Ui.Maybe(tab == "code", <CodeEditor Entry={entry} Session={session} key={entry.Id + "-" + session.ActiveFormat.ToString()} />)}
+                {Ui.Maybe(tab == "css", <CssEditor Entry={entry} Session={session} key={entry.Id + "-css"} />)}
+                {Ui.Maybe(tab == "rules", <RulesView Entry={entry} key={entry.Id + "-rules"} />)}
+                {Ui.Maybe(tab == "export", <ExportView Entry={entry} Session={session} key={entry.Id + "-export"} />)}
+            </section>;
+    }
+
+    private static Node EditorTab(string id, string label, string glyph, AppSession session)
+    {
+        return
+            <button className={"editor-tab" + (session.WorkspaceTab == id ? " is-active" : "")}
+                    onClick={() => session.SetWorkspaceTab(id)}>
+                <span className="fa">{glyph}</span>
+                <span>{label}</span>
+            </button>;
+    }
+}
+
+public sealed class CodeEditorProps : Props
+{
+    public ComponentEntry? Entry { get; init; }
+    public AppSession? Session { get; init; }
+}
+
+public sealed class CodeEditor : Component<CodeEditorProps>
+{
+    public override Node Render()
+    {
+        var entry = Props.Entry!;
+        var session = Props.Session!;
+        var state = entry.Formats[session.ActiveFormat];
+        var fileName = NameService.FileName(entry.Name) + (session.ActiveFormat switch
+        {
+            OutputFormat.React => ".jsx",
+            OutputFormat.Csx => ".csx",
+            _ => ".html"
+        });
+        var lines = 1 + (state.Source ?? "").Count(c => c == '\n');
+        var contentHeight = Math.Max(160, (int)(lines * 17.6) + 36);
+
+        return
+            <div className="editor-body">
+                <div className="editor-filebar">
+                    <span className="mono file-name">{fileName}</span>
+                    <span className="muted small">{state.Edited ? "edited" : "generated"}</span>
+                    <div className="spacer"></div>
+                    <button className="mini-btn" onClick={() => session.RegenerateFormat()}>Regenerate</button>
+                </div>
+                <div className="editor-scroll">
+                    <textarea
+                        className="editor-area"
+                        value={state.Source}
+                        onInput={text => session.UpdateSource(text)}
+                        Attributes={new Dictionary<string, string>
+                        {
+                            ["spellcheck"] = "false",
+                            ["wrap"] = "off",
+                            ["style"] = $"height:{contentHeight}px;min-height:{contentHeight}px;"
+                        }} />
+                </div>
+                <div className="editor-note">
+                    {entry.ExposeProperties
+                        ? "Content properties are exposed. Values remain editable in the generated source."
+                        : "Static content is preserved exactly. Enable Props to parameterise headings, images and labels."}
+                </div>
+            </div>;
+    }
+}
+
+public sealed class CssEditorProps : Props
+{
+    public ComponentEntry? Entry { get; init; }
+    public AppSession? Session { get; init; }
+}
+
+public sealed class CssEditor : Component<CssEditorProps>
+{
+    public override Node Render()
+    {
+        var entry = Props.Entry!;
+        var session = Props.Session!;
+        var lines = 1 + (entry.CssText ?? "").Count(c => c == '\n');
+        var contentHeight = Math.Max(160, (int)(lines * 17.6) + 36);
+        return
+            <div className="editor-body">
+                <div className="editor-filebar">
+                    <span className="mono file-name">{NameService.FileName(entry.Name)}.css</span>
+                    <span className="muted small">{entry.MediaRuleCount} responsive rules</span>
+                    <div className="spacer"></div>
+                    <button className="mini-btn" onClick={() => session.RegenerateCss()}>Regenerate CSS</button>
+                </div>
+                <div className="editor-scroll">
+                    <textarea
+                        className="editor-area"
+                        value={entry.CssText}
+                        onInput={text => session.UpdateCss(text)}
+                        Attributes={new Dictionary<string, string>
+                        {
+                            ["spellcheck"] = "false",
+                            ["wrap"] = "off",
+                            ["style"] = $"height:{contentHeight}px;min-height:{contentHeight}px;"
+                        }} />
+                </div>
+                <div className="editor-note">
+                    The preview updates after you pause typing. Original media and container queries are kept intact.
+                </div>
+            </div>;
+    }
+}
+
+public sealed class RulesViewProps : Props
+{
+    public ComponentEntry? Entry { get; init; }
+}
+
+public sealed class RulesView : Component<RulesViewProps>
+{
+    public override Node Render()
+    {
+        var entry = Props.Entry!;
+        return
+            <div className="editor-body">
+                <div className="editor-filebar">
+                    <span className="mono file-name">Rules</span>
+                    <span className="muted small">{entry.Rules.Count} recovered</span>
+                </div>
+                <div className="rules-scroll">
+                    {entry.Rules.Count == 0
+                        ? <div className="muted small">No recoverable source rules. Computed fallback is used.</div>
+                        : Ui.List(entry.Rules, (rule, index) =>
+                            <div className="rule-card" key={index + rule.Selector + rule.ConditionLabel}>
+                                <div className="rule-card-head">
+                                    <span className={rule.Conditions.Count > 0 ? "rule-chip responsive" : "rule-chip"}>
+                                        {rule.Conditions.Count > 0 ? "responsive" : "base"}
+                                    </span>
+                                    <span className="mono rule-selector">{rule.Selector}</span>
+                                </div>
+                                {Ui.Maybe(rule.Conditions.Count > 0, <div className="rule-conditions mono">{string.Join("  ·  ", rule.Conditions)}</div>)}
+                                <div className="rule-declarations mono">{rule.ShortDeclarations}</div>
+                                <div className="rule-source mono">{rule.Source}</div>
+                            </div> )}
+                </div>
+            </div>;
+    }
+}
+
+public sealed class ExportViewProps : Props
+{
+    public ComponentEntry? Entry { get; init; }
+    public AppSession? Session { get; init; }
+}
+
+public sealed class ExportView : Component<ExportViewProps>
+{
+    public override Node Render()
+    {
+        var entry = Props.Entry!;
+        var session = Props.Session!;
+        var missing = entry.Assets.Where(a => a.LocalPath is null).ToList();
+
+        return
+            <div className="editor-body">
+                <div className="editor-filebar">
+                    <span className="mono file-name">Export package</span>
+                    <span className="muted small">HTML · React · CSX</span>
+                </div>
+                <div className="export-scroll">
+                    <div className="export-card">
+                        <div className="export-card-title">Formats</div>
+                        <div className="export-formats">
+                            {FormatChoice(OutputFormat.React, "React / JSX", session)}
+                            {FormatChoice(OutputFormat.Csx, "Donkeh / CSX", session)}
+                            {FormatChoice(OutputFormat.Html, "Standalone HTML", session)}
+                        </div>
+                        <div className="export-actions">
+                            <button className="export-btn" onClick={() => session.ExportActive(session.ActiveFormat, false)}>
+                                <span className="fa">{Icons.Download}</span>
+                                <span>Export {session.ActiveFormat.ToString()}</span>
+                            </button>
+                            <button className="export-btn secondary" onClick={() => session.ExportActive(session.ActiveFormat, true)}>
+                                Export all formats
+                            </button>
+                        </div>
+                        <div className="export-actions">
+                            <button className="export-btn secondary" onClick={() => session.ExportEverything()}>
+                                Export every component
+                            </button>
+                            <button className="export-btn ghost" onClick={() => session.OpenExportFolder()}>
+                                <span className="fa">{Icons.FolderOpen}</span>
+                                <span>Open folder</span>
+                            </button>
+                        </div>
+                        {Ui.Maybe(session.LastExportPath is not null, <div className="export-path mono">{session.LastExportPath}</div>)}
+                    </div>
+
+                    <div className="export-card">
+                        <div className="export-card-title">Package contents</div>
+                        <div className="export-tree mono">
+                            <div>{NameService.FileName(entry.Name)}/</div>
+                            <div className="tree-indent">react/{NameService.FileName(entry.Name)}.jsx</div>
+                            <div className="tree-indent">csx/{NameService.FileName(entry.Name)}.csx</div>
+                            <div className="tree-indent">html/index.html · styles.css</div>
+                            <div className="tree-indent">assets/ ({entry.Assets.Count} files)</div>
+                            <div className="tree-indent">manifest.json</div>
+                        </div>
+                    </div>
+
+                    <div className="export-card">
+                        <div className="export-card-title">Fidelity report</div>
+                        <div className="report-row"><span>Extraction mode</span><b>{entry.Mode.ToString()}</b></div>
+                        <div className="report-row"><span>Recovered rules</span><b>{entry.Rules.Count}</b></div>
+                        <div className="report-row"><span>Responsive rules</span><b>{entry.MediaRuleCount}</b></div>
+                        <div className="report-row"><span>Computed fallback</span><b>{entry.Data?.UsedComputedFallback == true ? "yes" : "no"}</b></div>
+                        <div className="report-row"><span>Retrieved assets</span><b>{entry.Assets.Count(a => a.LocalPath is not null)} / {entry.Assets.Count}</b></div>
+                    </div>
+
+                    {Ui.Maybe(missing.Count > 0,
+                        <div className="notice warn">
+                            <b>{missing.Count} resource{missing.Count == 1 ? "" : "s"} could not be downloaded.</b>
+                            <div className="missing-list">
+                                {Ui.List(missing.Take(8), asset => <div className="mono truncate" key={asset.Url}>{asset.Url}</div>)}
+                            </div>
+                        </div>)}
+
+                    {Ui.Maybe(entry.Warnings.Count > 0,
+                        <div className="export-card">
+                            <div className="export-card-title">Extraction notes</div>
+                            {Ui.List(entry.Warnings, (warning, index) =>
+                                <div className={"notice " + warning.Severity} key={index + warning.Message}>
+                                    <b>{warning.Severity}</b> {warning.Message}
+                                </div> )}
+                        </div>)}
+                </div>
+            </div>;
+    }
+
+    private static Node FormatChoice(OutputFormat format, string label, AppSession session)
+    {
+        var active = session.ActiveFormat == format;
+        return
+            <button className={"format-choice" + (active ? " is-active" : "")}
+                    onClick={() => session.SetFormat(format)}>
+                <span className="format-choice-label">{label}</span>
+                <span className="format-choice-mark fa">{active ? Icons.CircleCheck : Icons.Circle}</span>
+            </button>;
+    }
+}

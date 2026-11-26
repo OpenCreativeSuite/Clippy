@@ -1,0 +1,61 @@
+using Donkeh.Windowing;
+
+namespace Clippy;
+
+/// <summary>
+/// Keeps captured pages and the live browser on the page the user opened.
+/// Clicks, form submissions and scripted popups are inert; only the address bar
+/// can start a new navigation. Page content stays untrusted and is never
+/// executed as app code.
+/// </summary>
+public static class NavigationGuard
+{
+    private const string Script = """
+        (function () {
+          if (window.__clippyGuard) return;
+          window.__clippyGuard = true;
+
+          function block(event) {
+            var target = event.target;
+            if (!target || !target.closest) return;
+            var link = target.closest('a[href], area[href], [role="link"]');
+            if (!link) return;
+            event.preventDefault();
+            // While inspecting, the inspector stops the event itself after
+            // recording the selection. Otherwise keep page routers from
+            // seeing the click at all.
+            if (!window.__clippyInspectorActive) {
+              event.stopPropagation();
+              if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+            }
+          }
+
+          document.addEventListener('click', block, true);
+          document.addEventListener('auxclick', block, true);
+          document.addEventListener('dragstart', block, true);
+          document.addEventListener('submit', function (event) { event.preventDefault(); }, true);
+
+          try { window.open = function () { return null; }; } catch (event) { }
+
+          // Freeze client-side routing so single-page apps stay on the doc.
+          try {
+            var noop = function () { return undefined; };
+            history.pushState = noop;
+            history.replaceState = noop;
+          } catch (event) { }
+        })();
+        """;
+
+    public static void Attach(WebView view)
+    {
+        try
+        {
+            view.Plugins.AddScript(WebViewScript.Preload("clippy-nav-guard", Script, null));
+            view.ExecuteJavaScript(Script);
+        }
+        catch
+        {
+            // Guarding navigation is best-effort; the page still renders.
+        }
+    }
+}

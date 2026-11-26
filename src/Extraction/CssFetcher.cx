@@ -1,0 +1,181 @@
+﻿using System.Net;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace Clippy;
+
+/// <summary>
+/// Retrieves stylesheets that the browser cannot read directly because of
+/// cross-origin restrictions, absolutises their URLs and injects them back into
+/// the page as same-origin style elements. This keeps selector matching inside
+/// the browser, where the live DOM is authoritative.
+/// </summary>
+public static class CssFetcher
+{
+    private const long MaxSheetBytes = 8L * 1024 * 1024;
+    private const int MaxDepth = 4;
+
+    private static readonly HttpClient Client = new HttpClient(new HttpClientHandler
+    {
+        AutomaticDecompression = DecompressionMethods.All,
+        AllowAutoRedirect = true,
+        MaxAutomaticRedirections = 6
+    })
+    {
+        Timeout = TimeSpan.FromSeconds(25)
+    };
+
+    private static readonly Regex ImportRule = new(
+        @"@import\s+(?:url\(\s*)?(?<q>['""]?)(?<url>[^'""\)\s]+)\k<q>\s*\)?(?<media>[^;]*);",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex UrlToken = new(
+        @"url\(\s*(?<q>['""]?)(?<url>.*?)\k<q>\s*\)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.Singleline);
+
+    public static async Task<int> ResolveAndInjectAsync(
+        AppSession session,
+        ExtractedComponent component,
+        HashSet<string> failed)
+    {
+        if (component.UnreadableSheets.Count == 0)
+            return 0;
+
+        var injected = 0;
+        foreach (var url in component.UnreadableSheets.Distinct(StringComparer.Ordinal))
+        {
+            if (string.IsNullOrWhiteSpace(url) || !url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var css = await FetchAsync(url, component.SourceUrl);
+            if (css is null)
+            {
+                failed.Add(url);
+                continue;
+            }
+
+            css = await ExpandImportsAsync(css, url, component.SourceUrl, failed, 0);
+            css = AbsolutizeUrls(css, url);
+            if (await InjectAsync(session, url, css))
+            {
+                injected++;            }
+        }
+
+        return injected;
+    }
+
+    private static async Task<bool> InjectAsync(AppSession session, string source, string css)
+    {
+        var script = "window.__clippy && window.__clippy.addStylesheetText(" +
+                     System.Text.Json.JsonSerializer.Serialize(source) + ", " +
+                     System.Text.Json.JsonSerializer.Serialize(css) + ")";
+        var result = await session.EvaluateJsAsync(script);
+        var text = JsonPayload.Unwrap(result);
+        return string.Equals(text, "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<string?> FetchAsync(string url, string referer)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            if (!string.IsNullOrWhiteSpace(referer))
+                request.Headers.Referrer = new Uri(referer);
+            using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            if (!response.IsSuccessStatusCode)
+                return null;
+            if ((response.Content.Headers.ContentLength ?? 0) > MaxSheetBytes)
+                return null;
+
+            await using var stream = await response.Content.ReadAsStreamAsync();
+            using var buffer = new MemoryStream();
+            var chunk = new byte[64 * 1024];
+            long total = 0;
+            while (true)
+            {
+                var read = await stream.ReadAsync(chunk);
+                if (read == 0)
+                    break;
+                total += read;
+                if (total > MaxSheetBytes)
+                    return null;
+                buffer.Write(chunk, 0, read);
+            }
+            return Encoding.UTF8.GetString(buffer.ToArray());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static async Task<string> ExpandImportsAsync(
+        string css,
+        string baseUrl,
+        string referer,
+        HashSet<string> failed,
+        int depth)
+    {
+        if (depth >= MaxDepth || string.IsNullOrEmpty(css))
+            return css;
+
+        var matches = ImportRule.Matches(css);
+        if (matches.Count == 0)
+            return css;
+
+        var builder = new StringBuilder();
+        var position = 0;
+        foreach (Match match in matches)
+        {
+            builder.Append(css, position, match.Index - position);
+            position = match.Index + match.Length;
+
+            var importUrl = match.Groups["url"].Value.Trim();
+            string absolute;
+            try { absolute = new Uri(new Uri(baseUrl), importUrl).AbsoluteUri; }
+            catch { absolute = importUrl; }
+
+            var imported = absolute.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                ? await FetchAsync(absolute, referer)
+                : null;
+            if (imported is null)
+            {
+                failed.Add(absolute);
+                builder.Append(match.Value);
+                continue;
+            }
+
+            imported = await ExpandImportsAsync(imported, absolute, referer, failed, depth + 1);
+            imported = AbsolutizeUrls(imported, absolute);
+            var media = match.Groups["media"].Value.Trim();
+            if (string.IsNullOrWhiteSpace(media) || media.Equals("all", StringComparison.OrdinalIgnoreCase))
+                builder.Append(imported);
+            else
+                builder.Append("@media ").Append(media).Append(" {\n").Append(imported).Append("\n}\n");
+        }
+        builder.Append(css, position, css.Length - position);
+        return builder.ToString();
+    }
+
+    public static string AbsolutizeUrls(string css, string baseUrl)
+    {
+        if (string.IsNullOrEmpty(css))
+            return css;
+
+        return UrlToken.Replace(css, match =>
+        {
+            var raw = match.Groups["url"].Value.Trim();
+            if (string.IsNullOrEmpty(raw) || raw.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                return match.Value;
+            try
+            {
+                var absolute = new Uri(new Uri(baseUrl), raw).AbsoluteUri;
+                return "url(\"" + absolute + "\")";
+            }
+            catch
+            {
+                return match.Value;
+            }
+        });
+    }
+}

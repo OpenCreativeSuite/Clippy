@@ -1,0 +1,81 @@
+using Donkeh.UILab;
+
+namespace Clippy.Ui;
+
+public static class Ui
+{
+    public static Node Button(string label, Action onClick, string className = "btn", bool disabled = false) =>
+        <button className={className} onClick={onClick} disabled={disabled}>{label}</button>;
+
+    public static Node IconButton(string glyph, string title, Action onClick, bool active = false, bool disabled = false, string extra = "") =>
+        <button
+            className={"icon-btn" + (active ? " is-active" : "") + (string.IsNullOrEmpty(extra) ? "" : " " + extra)}
+            title={title}
+            onClick={onClick}
+            disabled={disabled}><span className="fa">{glyph}</span></button>;
+
+    public static Node Icon(string glyph, string extra = "") =>
+        <span className={"fa" + (string.IsNullOrEmpty(extra) ? "" : " " + extra)}>{glyph}</span>;
+
+    public static Node TextButton(string label, Action onClick, string className = "text-btn", bool disabled = false) =>
+        <button className={className} onClick={onClick} disabled={disabled}>{label}</button>;
+
+    public static Node ActionButton(string glyph, string label, Action onClick, string className = "action-btn") =>
+        <button className={className} onClick={onClick}>
+            <span className="fa">{glyph}</span>
+            <span>{label}</span>
+        </button>;
+
+    public static Node Pill(string text, string tone = "") =>
+        <span className={"pill" + (string.IsNullOrEmpty(tone) ? "" : " tone-" + tone)}>{text}</span>;
+
+    public static Node Maybe(bool when, Node node) => when ? node : null!;
+
+    public static Node List<T>(IEnumerable<T> items, Func<T, Node> render) =>
+        Donkeh.UILab._.Each(items, render);
+
+    public static Node List<T>(IEnumerable<T> items, Func<T, int, Node> render)
+    {
+        var index = 0;
+        return Donkeh.UILab._.Each(items, item => render(item, index++));
+    }
+
+    public static Node Dot(string tone = "") =>
+        <span className={"dot" + (string.IsNullOrEmpty(tone) ? "" : " tone-" + tone)}></span>;
+
+    public static Node Field(
+        string label,
+        string value,
+        Action<string> onInput,
+        string placeholder = "",
+        string className = "field") =>
+        <label className={className}>
+            <span className="field-label">{label}</span>
+            <input className="field-input" value={value} onInput={onInput} placeholder={placeholder} />
+        </label>;
+
+    public static Node TextArea(
+        string value,
+        Action<string> onInput,
+        string className = "editor-area",
+        int rows = 12) =>
+        <textarea
+            className={className}
+            value={value}
+            onInput={onInput}
+            Attributes={new Dictionary<string, string>
+            {
+                ["spellcheck"] = "false",
+                ["rows"] = rows.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            }} />;
+
+    public static Node Empty(string title, string detail, string glyph = "\uf05a") =>
+        <div className="empty">
+            <div className="empty-glyph"><span className="fa">{glyph}</span></div>
+            <div className="empty-title">{title}</div>
+            <div className="empty-detail">{detail}</div>
+        </div>;
+
+    public static Node KeyHint(string key, string text) =>
+        <span className="key-hint"><span className="kbd">{key}</span>{text}</span>;
+}

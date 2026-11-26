@@ -1,0 +1,503 @@
+﻿using Donkeh.UILab;
+using Donkeh.Windowing;
+using Clippy.Ui;
+
+namespace Clippy.Ui;
+
+public sealed class AppShell : Component
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var (version, setVersion, bumpVersion) = StateWithUpdate(0);
+
+        Effect(() =>
+        {
+            session.UiContext = SynchronizationContext.Current;
+            void Handler() => bumpVersion(v => v + 1);
+            session.Changed += Handler;
+            return () => session.Changed -= Handler;
+        }, []);
+
+        var _keep = version;
+
+        return
+            <div className="app-shell">
+                <TitleBar />
+                {session.WorkspaceOpen
+                    ? <WorkspaceView />
+                    : <div className="app-main">
+                        <SelectionSidebar />
+                        <BrowserStage />
+                        <DetailsPanel />
+                      </div>}
+                <StatusBar />
+                {Ui.Maybe(session.ExportNoticeVisible && session.LastExportPath is not null, <ExportToast />)}
+            </div>;
+    }
+}
+
+public sealed class TitleBar : Component
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var (draft, setDraft) = State(session.Browser.Address);
+        var (focused, setFocused) = State(false);
+
+        Effect(() =>
+        {
+            if (!focused)
+                setDraft(session.Browser.Address);
+        }, [session.Browser.Address, focused]);
+
+        void Submit()
+        {
+            session.Navigate(draft);
+            setFocused(false);
+        }
+
+        var readyCount = session.Components.Count(c => c.IsReady);
+        var liveCount = session.Browser.Selections.Count;
+
+        return
+            <header className="titlebar">
+                <div className="brand" onClick={() => session.OpenHome()}>
+                    <div className="brand-mark"><span className="fa">{Icons.Scissors}</span></div>
+                    <div className="brand-text">
+                        <div className="brand-name">Clippy</div>
+                        <div className="brand-sub">Clip any element</div>
+                    </div>
+                </div>
+
+                <div className="nav-cluster">
+                    {Ui.IconButton(Icons.ArrowLeft, "Back", () => session.Back(), disabled: !session.Browser.CanBack)}
+                    {Ui.IconButton(Icons.ArrowRight, "Forward", () => session.Forward(), disabled: !session.Browser.CanForward)}
+                    {Ui.IconButton(Icons.ArrowsRotate, "Reload", () => session.Reload())}
+                    {Ui.IconButton(Icons.House, "Start page", () => session.OpenHome())}
+                </div>
+
+                <form className="address-form" onSubmit={Submit}>
+                    <span className={"address-dot" + (session.Browser.Loading ? " is-loading" : "")}></span>
+                    <input
+                        className="address-input"
+                        value={draft}
+                        placeholder="Enter a URL, or search the web…"
+                        onInput={setDraft}
+                        onFocus={() => setFocused(true)}
+                        onBlur={() => setFocused(false)}
+                        onKeyDown={key =>
+                        {
+                            if (key == "Enter")
+                                Submit();
+                        }} />
+                    <button className="address-go" type="submit" title="Go"><span className="fa">{Icons.ArrowRight}</span></button>
+                </form>
+
+                <div className="zoom-cluster">
+                    {Ui.IconButton(Icons.Minus, "Zoom out", () => session.SetZoom(session.Browser.ZoomPercent - 10), disabled: session.Browser.ZoomPercent <= 30, extra: "tiny")}
+                    <span className="zoom-label">{session.Browser.ZoomPercent}%</span>
+                    {Ui.IconButton(Icons.Plus, "Zoom in", () => session.SetZoom(session.Browser.ZoomPercent + 10), disabled: session.Browser.ZoomPercent >= 250, extra: "tiny")}
+                </div>
+
+                <button
+                    className={"inspect-toggle" + (session.Browser.InspectorActive ? " is-active" : "")}
+                    onClick={() => session.ToggleInspector()}>
+                    <span className="inspect-target fa">{Icons.Crosshairs}</span>
+                    <span>{session.Browser.InspectorActive ? "Inspecting" : "Inspect"}</span>
+                    <span className="inspect-count">{liveCount}</span>
+                </button>
+
+                <button className={"workspace-btn" + (session.WorkspaceOpen ? " is-active" : "")} onClick={() => session.ToggleWorkspace()}>
+                    <span className="workspace-glyph fa">{Icons.TableColumns}</span>
+                    <span>{session.WorkspaceOpen ? "Browser" : "Workspace"}</span>
+                    <span className="workspace-count">{readyCount}</span>
+                </button>
+            </header>;
+    }
+}
+
+public sealed class SelectionSidebar : Component
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var top = session.TopLevelComponents;
+        var total = session.Components.Count;
+
+        return
+            <aside className="sidebar">
+                <div className="sidebar-head">
+                    <div className="sidebar-title">
+                        <span className="sidebar-eyebrow">Captures</span>
+                        <span className="sidebar-count">{total}</span>
+                    </div>
+                    <div className="sidebar-actions">
+                        {Ui.IconButton(Icons.ArrowsRotate, "Refresh every capture", () => session.RefreshAllFromBrowser(), disabled: total == 0, extra: "tiny")}
+                        {Ui.IconButton(Icons.Trash, "Remove all captures", () => session.ClearAllComponents(), disabled: total == 0, extra: "tiny")}
+                    </div>
+                </div>
+
+                <div className="sidebar-scroll">
+                    {top.Count == 0
+                        ? <div className="fragment">{Ui.Empty("Nothing clipped yet", "Turn on Inspect, hover the page and click an element.", Icons.Crosshairs)}</div>
+                        : <div className="fragment">{Ui.List(top, entry => RenderEntry(session, entry, 0))}</div>}
+                </div>
+
+                <div className="sidebar-foot">
+                    {session.Browser.InspectorActive
+                        ? <div className="fragment">
+                            {Ui.KeyHint("Click", " clip")}
+                            {Ui.KeyHint("Shift", " add")}
+                            {Ui.KeyHint("Alt", " parent")}
+                          </div>
+                        : <span className="muted">Inspect is off — the page is interactive.</span>}
+                </div>
+            </aside>;
+    }
+
+    private static Node RenderEntry(AppSession session, ComponentEntry entry, int depth)
+    {
+        var children = session.ChildrenOf(entry.Id);
+        var active = session.ActiveComponentId == entry.Id;
+        var selection = entry.Selection;
+        var statusTone = entry.Status switch
+        {
+            CaptureStatus.Ready => "ok",
+            CaptureStatus.Extracting => "busy",
+            CaptureStatus.Error => "error",
+            _ => "idle"
+        };
+
+        return
+            <div className="tree-block" key={entry.Id}>
+                <div
+                    className={"capture" + (active ? " is-active" : "") + (depth > 0 ? " is-nested" : "")}
+                    onClick={() => session.SelectComponent(entry.Id)}>
+                    <div className="capture-top">
+                        {Ui.Dot(statusTone)}
+                        <div className="capture-name">{entry.Name}</div>
+                        <div className="capture-badge">{entry.StatusLabel}</div>
+                    </div>
+                    <div className="capture-meta">
+                        <span className="mono">{selection?.Tag ?? entry.Data?.Root?.Tag ?? "element"}</span>
+                        <span className="capture-size">{entry.SizeLabel}</span>
+                        {Ui.Maybe(entry.MediaRuleCount > 0, <span className="capture-media">{entry.MediaRuleCount} responsive</span>)}
+                    </div>
+                    <div className="capture-actions">
+                        {Ui.Maybe(selection is not null, Ui.IconButton(Icons.ArrowUp, "Select parent", () => session.ClimbSelection(selection!.Id), extra: "tiny"))}
+                        {Ui.Maybe(entry.ParentId is not null, Ui.IconButton(Icons.ArrowUpFromBracket, "Promote", () => session.PromoteComponent(entry.Id), extra: "tiny"))}
+                        {Ui.IconButton(Icons.Pen, "Open workspace", () => session.OpenWorkspace(entry.Id), extra: "tiny accent")}
+                        {Ui.IconButton(Icons.Xmark, "Remove", () => session.RemoveComponent(entry.Id), extra: "tiny danger")}
+                    </div>
+                </div>
+                <div className="fragment">{Ui.List(children, child => RenderEntry(session, child, depth + 1))}</div>
+            </div>;
+    }
+}
+
+public sealed class BrowserStage : Component
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+
+        return
+            <main className="browser-stage">
+                <div className="stage-head">
+                    <div className="stage-title">
+                        <span className="stage-title-text">{session.Browser.Title}</span>
+                        <span className="stage-url">{ShortUrl(session.Browser.Url)}</span>
+                    </div>
+                    <div className="stage-meta">
+                        {Ui.Maybe(session.Browser.InspectorActive, Ui.Pill("Inspect", "inspect"))}
+                        <span className="mono stage-size">{session.Browser.PageWidth} × {session.Browser.PageHeight}</span>
+                        {Ui.Dot(session.Browser.Loading ? "busy" : "ok")}
+                    </div>
+                </div>
+
+                <div className="browser-frame">
+                    {BrowserHost()}
+                    {Ui.Maybe(session.Browser.InspectorActive,
+                        <div className="inspect-ribbon">
+                            <span className="inspect-ribbon-icon fa">{Icons.Crosshairs}</span>
+                            Hover to inspect · click to clip · Shift for more · Alt for parent
+                        </div>)}
+                </div>
+            </main>;
+    }
+
+    private static Node BrowserHost()
+    {
+        var session = AppSession.Current;
+        return _.H("webview", new WebViewProps
+        {
+            Src = session.Browser.Src,
+            ClassName = "browser",
+            OnReady = view =>
+            {                session.AttachWebView(view);
+            }
+        });
+    }
+
+    private static string ShortUrl(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return "Start page";
+        if (url.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            return "Clippy start page";
+        return url.Length > 86 ? url[..83] + "…" : url;
+    }
+}
+
+public sealed class DetailsPanel : Component
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var entry = session.SelectedComponent ?? session.ActiveComponent;
+
+        return
+            <aside className="details">
+                <div className="details-head">
+                    <div>
+                        <div className="sidebar-eyebrow">Inspector</div>
+                        <div className="details-title">{entry?.Name ?? "Selection"}</div>
+                    </div>
+                    <button className={"ghost-toggle" + (session.ShowAdvancedDetails ? " is-active" : "")}
+                            onClick={() => session.ToggleAdvanced()}>
+                        <span className="fa">{session.ShowAdvancedDetails ? Icons.ChevronUp : Icons.ChevronDown}</span>
+                    </button>
+                </div>
+
+                {entry is null
+                    ? <div className="fragment">{Ui.Empty("Select an element", "Its structure, styling, responsive rules and assets will appear here.", Icons.Crosshairs)}</div>
+                    : <div className="details-scroll">
+                        <RenameBox ComponentId={entry.Id} />
+                        <div className="details-section">
+                            <div className="section-head">
+                                <span>Element</span>
+                                {Ui.Pill(entry.StatusLabel, entry.Status == CaptureStatus.Ready ? "ok" : entry.Status == CaptureStatus.Error ? "error" : "busy")}
+                            </div>
+                            <div className="kv">
+                                <span className="kv-key">Tag</span><span className="kv-value mono">{entry.Selection?.Tag ?? entry.Data?.Root?.Tag ?? "—"}</span>
+                                <span className="kv-key">Size</span><span className="kv-value mono">{entry.SizeLabel}</span>
+                                <span className="kv-key">Classes</span><span className="kv-value mono">{string.Join(" ", entry.Selection?.Classes ?? [])}</span>
+                                <span className="kv-key">Source</span><span className="kv-value mono truncate">{ShortUrl(entry.SourceUrl)}</span>
+                                <span className="kv-key">Viewport</span><span className="kv-value mono">{entry.ViewportWidth} × {entry.ViewportHeight}</span>
+                            </div>
+                            <div className="path-line">
+                                {Ui.List(entry.Selection?.Path ?? entry.Data?.Path ?? [], part =>
+                                    <span className="path-chip" key={part.Index + "-" + part.Display}>{part.Display}</span> )}
+                            </div>
+                        </div>
+
+                        {Ui.Maybe(entry.Status == CaptureStatus.Error,
+                            <div className="notice error">
+                                <b>Extraction failed.</b> {entry.Error}
+                                <div className="notice-actions">
+                                    {Ui.TextButton("Try again", () => session.RefreshExtraction(entry.Id), "mini-btn")}
+                                </div>
+                            </div>)}
+
+                        <div className="details-section">
+                            <div className="section-head"><span>Actions</span></div>
+                            <div className="action-grid">
+                                {Ui.ActionButton(Icons.TableColumns, "Workspace", () => session.OpenWorkspace(entry.Id), "action-btn accent")}
+                                {Ui.ActionButton(Icons.ArrowsRotate, "Re-extract", () => session.RefreshExtraction(entry.Id))}
+                                {Ui.Maybe(entry.Selection is not null, Ui.ActionButton(Icons.ArrowUp, "Parent", () => session.ClimbSelection(entry.Selection!.Id)))}
+                                {Ui.ActionButton(Icons.ChevronUp, "Move up", () => session.MoveComponent(entry.Id, -1))}
+                                {Ui.ActionButton(Icons.ChevronDown, "Move down", () => session.MoveComponent(entry.Id, 1))}
+                                {Ui.ActionButton(Icons.Trash, "Remove", () => session.RemoveComponent(entry.Id), "action-btn danger")}
+                            </div>
+                        </div>
+
+                        {entry.Data?.Root is not null
+                            ? <div className="details-section">
+                                <div className="section-head"><span>Child elements</span><span className="section-count">{entry.Data.Root.Children.Count(c => c.Tag != "#text")}</span></div>
+                                <div className="child-list">
+                                    {Ui.List(entry.Data.Root.Children.Where(c => c.Tag != "#text").Take(10), child =>
+                                        <div className="child-row" key={child.Index.ToString()}>
+                                            <span className="mono child-tag">{child.Tag}</span>
+                                            <span className="mono child-classes truncate">{string.Join(" ", child.Attributes.GetValueOrDefault("class", "").Split(' ', StringSplitOptions.RemoveEmptyEntries).Take(3))}</span>
+                                            <button className="mini-btn" title="Clip this child" onClick={() => session.CaptureDescendant(entry, child.Index)}><span className="fa">{Icons.Scissors}</span></button>
+                                        </div>)}
+                                </div>
+                            </div>
+                            : null}
+
+                        {entry.Data is not null
+                            ? <div className="fragment">
+                                <div className="details-section">
+                                    <div className="section-head"><span>Extraction</span><span className="section-count">{entry.Data.NodeCount} nodes</span></div>
+                                    <div className="stat-row">
+                                        <div className="stat"><b>{entry.Data.Rules.Count}</b><span>CSS rules</span></div>
+                                        <div className="stat"><b>{entry.MediaRuleCount}</b><span>responsive</span></div>
+                                        <div className="stat"><b>{entry.Data.Assets.Count}</b><span>assets</span></div>
+                                        <div className="stat"><b>{entry.WarningCount}</b><span>warnings</span></div>
+                                    </div>
+                                    {Ui.Maybe(entry.Data.UsedComputedFallback,
+                                        <div className="notice warn">Computed styles supplement the recovered rules.</div>)}
+                                </div>
+
+                                <div className="details-section">
+                                    <div className="section-head"><span>Responsive rules</span><span className="section-count">{entry.MediaRuleCount}</span></div>
+                                    {entry.MediaRuleCount == 0
+                                        ? <div className="muted small">No media or container queries affect this element.</div>
+                                        : <div className="rule-list">
+                                            {Ui.List(entry.Rules.Where(r => r.Conditions.Count > 0).Take(8), rule =>
+                                                <div className="rule-row" key={rule.Selector + rule.ConditionLabel}>
+                                                    <div className="rule-condition mono">{rule.ConditionLabel}</div>
+                                                    <div className="rule-selector mono">{rule.Selector}</div>
+                                                </div> )}
+                                          </div>}
+                                </div>
+
+                                <div className="details-section">
+                                    <div className="section-head"><span>Assets</span><span className="section-count">{entry.Assets.Count}</span></div>
+                                    {entry.Assets.Count == 0
+                                        ? <div className="muted small">No images or fonts referenced.</div>
+                                        : <div className="asset-list">
+                                            {Ui.List(entry.Assets.Take(session.ShowAdvancedDetails ? 40 : 6), asset =>
+                                                <div className="asset-row" key={asset.Url} title={asset.FileName ?? asset.Url}>
+                                                    <span className={"asset-kind tone-" + (asset.LocalPath is null ? "error" : "ok")}>{asset.Kind}</span>
+                                                    <span className="mono truncate">{asset.FileName ?? asset.Url}</span>
+                                                    <span className="asset-size">{asset.Size > 0 ? FormatBytes(asset.Size) : "—"}</span>
+                                                </div> )}
+                                          </div>}
+                                </div>
+
+                                {Ui.Maybe(entry.Warnings.Count > 0,
+                                    <div className="details-section">
+                                        <div className="section-head"><span>Notes</span><span className="section-count">{entry.Warnings.Count}</span></div>
+                                        <div className="notice-list">
+                                            {Ui.List(entry.Warnings.Take(session.ShowAdvancedDetails ? 20 : 4), w =>
+                                                <div className={"notice " + w.Severity} key={w.Code + w.Message}>
+                                                    <b>{w.Severity}</b> {w.Message}
+                                                </div> )}
+                                        </div>
+                                    </div>)}
+
+                                {Ui.Maybe(session.ShowAdvancedDetails && entry.Selection is not null,
+                                    <div className="details-section">
+                                        <div className="section-head"><span>Computed style</span><span className="section-count">root</span></div>
+                                        <div className="computed">
+                                            {Ui.List(entry.Data.RootComputed.Take(28), kv =>
+                                                <div className="computed-row" key={kv.Key}>
+                                                    <span className="mono">{kv.Key}</span>
+                                                    <span className="mono muted truncate">{kv.Value}</span>
+                                                </div> )}
+                                        </div>
+                                    </div>)}
+                              </div>
+                            : <div className="details-section"><div className="muted small">Extraction is running. The component will appear when it is ready.</div></div>}
+                    </div>}
+            </aside>;
+    }
+
+    private static string ShortUrl(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return "—";
+        return url.Length > 40 ? url[..37] + "…" : url;
+    }
+
+    private static string FormatBytes(long bytes) => bytes switch
+    {
+        < 1024 => bytes + " B",
+        < 1024 * 1024 => (bytes / 1024.0).ToString("0.#") + " KB",
+        _ => (bytes / (1024.0 * 1024.0)).ToString("0.#") + " MB"
+    };
+}
+
+public sealed class RenameBoxProps : Props
+{
+    public string ComponentId { get; init; } = "";
+}
+
+public sealed class RenameBox : Component<RenameBoxProps>
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var entry = session.Components.FirstOrDefault(c => c.Id == Props.ComponentId);
+        var (text, setText) = State(entry?.Name ?? "");
+
+        Effect(() =>
+        {
+            setText(entry?.Name ?? "");
+        }, [entry?.Name]);
+
+        void Commit()
+        {
+            if (entry is not null)
+                session.RenameComponent(entry.Id, text);
+        }
+
+        return
+            <div className="rename-row">
+                <span className="rename-label">Name</span>
+                <input
+                    className="rename-input"
+                    value={text}
+                    onInput={setText}
+                    onBlur={() => Commit()}
+                    onKeyDown={key =>
+                    {
+                        if (key == "Enter")
+                            Commit();
+                    }} />
+                <span className="rename-ext">component</span>
+            </div>;
+    }
+}
+
+public sealed class ExportToast : Component
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var path = session.LastExportPath ?? ExportService.ExportRoot;
+        return
+            <div className="export-toast">
+                <div className="export-toast-icon fa">{Icons.CircleCheck}</div>
+                <div className="export-toast-body">
+                    <div className="export-toast-title">Saved {session.LastExportName ?? "component"}</div>
+                    <div className="export-toast-path mono truncate" title={path}>{path}</div>
+                </div>
+                <button className="export-toast-btn" onClick={() => session.OpenExportFolder()}>
+                    <span className="fa">{Icons.FolderOpen}</span>
+                    <span>Open folder</span>
+                </button>
+                <button className="export-toast-close" title="Dismiss" onClick={() => session.DismissExportNotice()}>
+                    <span className="fa">{Icons.Xmark}</span>
+                </button>
+            </div>;
+    }
+}
+
+public sealed class StatusBar : Component
+{
+    public override Node Render()
+    {
+        var session = AppSession.Current;
+        var warningCount = session.Warnings.Count(w => w.Severity != "info") +
+                           session.Components.Sum(c => c.WarningCount);
+
+        return
+            <footer className="statusbar">
+                <div className="status-left">
+                    {Ui.Dot(session.StatusTone == "idle" ? "" : session.StatusTone)}
+                    <span className="status-message">{session.StatusMessage}</span>
+                </div>
+                <div className="status-right">
+                    {Ui.Maybe(warningCount > 0, <button className="status-warning" onClick={() => session.ToggleAdvanced()}>{warningCount} warning{warningCount == 1 ? "" : "s"}</button>)}
+                    <span className="status-sep">·</span>
+                    <span className="status-small">{session.Browser.PageWidth} × {session.Browser.PageHeight}</span>
+                    <span className="status-sep">·</span>
+                    <span className="status-small">{session.Browser.ZoomPercent}%</span>
+                    {Ui.Maybe(session.LastExportPath is not null, <button className="status-link" onClick={() => session.OpenExportFolder()}>Open export folder</button>)}
+                </div>
+            </footer>;
+    }
+}

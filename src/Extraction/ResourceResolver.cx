@@ -1,0 +1,438 @@
+using System.Collections.Concurrent;
+using System.Net;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace Clippy;
+
+/// <summary>
+/// Downloads the images, fonts and other visual resources referenced by an
+/// extraction, then rewrites every reference to a local asset path.
+/// </summary>
+public static class ResourceResolver
+{
+    private const long MaxAssetBytes = 32L * 1024 * 1024;
+    private const long MaxTotalBytes = 220L * 1024 * 1024;
+
+    private static readonly HttpClient Client = CreateClient();
+    private static readonly Regex CssUrl = new(
+        @"url\(\s*(?<q>['""]?)(?<url>.*?)\k<q>\s*\)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.Singleline);
+
+    private static HttpClient CreateClient()
+    {
+        var handler = new HttpClientHandler
+        {
+            AutomaticDecompression = DecompressionMethods.All,
+            AllowAutoRedirect = true,
+            MaxAutomaticRedirections = 8
+        };
+        var client = new HttpClient(handler)
+        {
+            Timeout = TimeSpan.FromSeconds(28)
+        };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Clippy/1.0 (OpenCreativeSuite)");
+        client.DefaultRequestHeaders.Accept.ParseAdd("*/*");
+        return client;
+    }
+
+    public static async Task ResolveAsync(AppSession session, ExtractedComponent component)
+    {
+        component.Assets ??= [];
+        component.Fonts ??= [];
+
+        foreach (var font in component.Fonts)
+        {
+            foreach (var url in font.Urls)
+            {
+                if (string.IsNullOrWhiteSpace(url))
+                    continue;
+                if (!component.Assets.Any(a => a.Url == url && a.Kind == "font"))
+                {
+                    component.Assets.Add(new AssetRef
+                    {
+                        Url = url,
+                        Kind = "font",
+                        Property = "font-face"
+                    });
+                }
+            }
+        }
+
+        var unique = new Dictionary<string, AssetRef>(StringComparer.Ordinal);
+        foreach (var asset in component.Assets)
+        {
+            if (string.IsNullOrWhiteSpace(asset.Url))
+                continue;
+            if (unique.ContainsKey(asset.Url))
+                continue;
+            unique[asset.Url] = asset;
+        }
+
+        var ordered = unique.Values.ToList();
+        var downloaded = new ConcurrentDictionary<string, AssetRef>(StringComparer.Ordinal);
+        var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        long totalBytes = 0;
+        var gate = new SemaphoreSlim(6, 6);
+
+        var tasks = ordered.Select(async asset =>
+        {
+            await gate.WaitAsync();
+            try
+            {
+                var result = await DownloadAsync(asset, session);
+                if (result.Data is not null)
+                {
+                    Interlocked.Add(ref totalBytes, result.Data.LongLength);
+                    if (totalBytes > MaxTotalBytes)
+                    {
+                        result.Error = "Total asset budget exceeded.";
+                        result.Data = null;
+                    }
+                }
+
+                result.FileName = MakeFileName(result, usedNames);
+                if (result.Data is not null)
+                    result.LocalPath = "assets/" + result.FileName;
+                else
+                    result.LocalPath = null;
+
+                downloaded[asset.Url] = result;
+            }
+            catch (Exception ex)
+            {
+                asset.Error = ex.Message;
+                downloaded[asset.Url] = asset;
+            }
+            finally
+            {
+                gate.Release();
+            }
+        });
+
+        await Task.WhenAll(tasks);
+
+        component.Assets = downloaded.Values
+            .Where(a => !string.IsNullOrWhiteSpace(a.Url))
+            .ToList();
+
+        var map = component.Assets
+            .Where(a => a.LocalPath is not null)
+            .ToDictionary(a => a.Url, a => a.LocalPath!, StringComparer.Ordinal);
+
+        foreach (var asset in component.Assets.Where(a => a.LocalPath is null))
+        {
+            component.Warnings.Add(new ExtractionWarning
+            {
+                Code = "asset-missing",
+                Severity = asset.Kind == "font" ? "error" : "warning",
+                Message = $"Could not retrieve {asset.Kind} resource: {Shorten(asset.Url)}" +
+                          (string.IsNullOrWhiteSpace(asset.Error) ? "" : $" ({asset.Error})")
+            });
+        }
+
+        // Font faces: rewrite every source URL and record which files made it.
+        foreach (var font in component.Fonts)
+        {
+            foreach (var url in font.Urls)
+            {
+                if (map.TryGetValue(url, out var local))
+                    font.LocalPaths.Add(local);
+            }
+            font.Src = ReplaceUrls(font.Src, map);
+        }
+
+        // DOM references.
+        if (component.Root is not null)
+        {
+            var usedFallback = false;
+            RewriteNode(component.Root, map, component, ref usedFallback);
+            component.UsedComputedFallback = usedFallback;
+        }
+
+        // Stylesheet references.
+        component.CssText = ReplaceUrls(component.CssText ?? "", map);
+
+        if (component.Assets.Any(a => a.LocalPath is null))
+        {
+            component.Warnings.Add(new ExtractionWarning
+            {
+                Code = "assets-incomplete",
+                Severity = "warning",
+                Message = "Some resources could not be downloaded. Their original URLs were kept in the output."
+            });
+        }
+    }
+
+    private static void RewriteNode(
+        SerializedNode node,
+        Dictionary<string, string> map,
+        ExtractedComponent component,
+        ref bool usedFallback)
+    {
+        if (node.Index > 0 && node.MatchedRules == 0)
+            usedFallback = true;
+
+        foreach (var key in node.Attributes.Keys.ToList())
+        {
+            var value = node.Attributes[key];
+            switch (key.ToLowerInvariant())
+            {
+                case "src":
+                case "poster":
+                case "data":
+                case "href":
+                case "xlink:href":
+                    if (map.TryGetValue(value, out var localAttr))
+                    {
+                        // Navigation targets stay as authored; only embedded resources localise.
+                        var tag = node.Tag ?? "";
+                        var navigation = tag.Equals("a", StringComparison.OrdinalIgnoreCase) ||
+                                         tag.Equals("area", StringComparison.OrdinalIgnoreCase);
+                        if (!navigation)
+                            node.Attributes[key] = localAttr;
+                    }
+                    break;
+                case "srcset":
+                case "imagesrcset":
+                    node.Attributes[key] = RewriteSrcSet(value, map);
+                    break;
+                case "style":
+                    node.Attributes[key] = ReplaceUrls(value, map);
+                    break;
+                case "content":
+                    if (value.StartsWith("url(", StringComparison.OrdinalIgnoreCase))
+                        node.Attributes[key] = ReplaceUrls(value, map);
+                    break;
+            }
+        }
+
+        if (node.Attributes.TryGetValue("style", out var style))
+            node.Attributes["style"] = NormalizeInlineStyle(style);
+
+        foreach (var child in node.Children)
+            RewriteNode(child, map, component, ref usedFallback);
+    }
+
+    private static string NormalizeInlineStyle(string style)
+    {
+        var text = style.Trim();
+        if (!text.EndsWith(';') && text.Length > 0)
+            text += ";";
+        return text;
+    }
+
+    public static string ReplaceUrls(string css, IReadOnlyDictionary<string, string> map)
+    {
+        if (string.IsNullOrEmpty(css))
+            return css;
+
+        return CssUrl.Replace(css, match =>
+        {
+            var original = match.Groups["url"].Value.Trim();
+            if (map.TryGetValue(original, out var local))
+                return "url(\"" + local + "\")";
+            if (map.TryGetValue(WebUtility.HtmlDecode(original), out local))
+                return "url(\"" + local + "\")";
+            return match.Value;
+        });
+    }
+
+    public static string RewriteSrcSet(string srcset, IReadOnlyDictionary<string, string> map)
+    {
+        if (string.IsNullOrWhiteSpace(srcset))
+            return srcset;
+
+        var parts = srcset.Split(',');
+        var output = new List<string>();
+        foreach (var part in parts)
+        {
+            var trimmed = part.Trim();
+            if (trimmed.Length == 0)
+                continue;
+            var space = trimmed.IndexOf(' ');
+            var url = space < 0 ? trimmed : trimmed[..space];
+            var descriptor = space < 0 ? "" : trimmed[space..];
+            if (map.TryGetValue(url, out var local))
+                output.Add(local + descriptor);
+            else
+                output.Add(trimmed);
+        }
+        return string.Join(", ", output);
+    }
+
+    private static async Task<AssetRef> DownloadAsync(AssetRef asset, AppSession session)
+    {
+        var url = asset.Url.Trim();
+        if (url.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+        {
+            var data = TryDecodeDataUri(url, out var mime);
+            if (data is null)
+            {
+                asset.Error = "Invalid data URI.";
+                return asset;
+            }
+            asset.Data = data;
+            asset.ContentType = mime;
+            asset.Size = data.Length;
+            return asset;
+        }
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
+            (uri.Scheme != "http" && uri.Scheme != "https"))
+        {
+            asset.Error = "Unsupported resource scheme.";
+            return asset;
+        }
+
+        try
+        {
+            using var response = await Client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
+            if (!response.IsSuccessStatusCode)
+            {
+                asset.Error = "HTTP " + (int)response.StatusCode;
+                return asset;
+            }
+
+            asset.ContentType = response.Content.Headers.ContentType?.MediaType;
+            var declared = response.Content.Headers.ContentLength ?? 0;
+            if (declared > MaxAssetBytes)
+            {
+                asset.Error = "Resource is larger than 32 MB.";
+                return asset;
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync();
+            using var buffer = new MemoryStream();
+            var chunk = new byte[64 * 1024];
+            long read = 0;
+            while (true)
+            {
+                var count = await stream.ReadAsync(chunk);
+                if (count == 0)
+                    break;
+                read += count;
+                if (read > MaxAssetBytes)
+                {
+                    asset.Error = "Resource is larger than 32 MB.";
+                    return asset;
+                }
+                buffer.Write(chunk, 0, count);
+            }
+
+            asset.Data = buffer.ToArray();
+            asset.Size = asset.Data.Length;
+            if (asset.Data.Length == 0)
+                asset.Error = "Resource was empty.";
+            return asset;
+        }
+        catch (Exception ex)
+        {
+            asset.Error = ex.Message;
+            return asset;
+        }
+    }
+
+    private static byte[]? TryDecodeDataUri(string url, out string mime)
+    {
+        mime = "application/octet-stream";
+        var comma = url.IndexOf(',');
+        if (comma < 0)
+            return null;
+        var meta = url[5..comma];
+        var payload = url[(comma + 1)..];
+        var isBase64 = meta.EndsWith(";base64", StringComparison.OrdinalIgnoreCase);
+        if (isBase64)
+            meta = meta[..^7];
+        if (!string.IsNullOrWhiteSpace(meta))
+            mime = meta;
+        try
+        {
+            return isBase64
+                ? Convert.FromBase64String(payload)
+                : Encoding.UTF8.GetBytes(Uri.UnescapeDataString(payload));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string MakeFileName(AssetRef asset, HashSet<string> used)
+    {
+        var uri = Uri.TryCreate(asset.Url, UriKind.Absolute, out var parsed) ? parsed : null;
+        var baseName = "";
+        if (uri is not null && !asset.Url.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                baseName = Path.GetFileName(uri.LocalPath);
+            }
+            catch { }
+        }
+
+        if (string.IsNullOrWhiteSpace(baseName))
+            baseName = asset.Kind == "font" ? "font" : "asset";
+
+        baseName = Uri.UnescapeDataString(baseName);
+        baseName = Regex.Replace(baseName, "[^A-Za-z0-9._-]+", "-").Trim('.', '-');
+        if (baseName.Length > 80)
+        {
+            var ext = Path.GetExtension(baseName);
+            var stem = Path.GetFileNameWithoutExtension(baseName);
+            baseName = stem[..Math.Min(stem.Length, 60)] + ext;
+        }
+
+        var extension = Path.GetExtension(baseName);
+        var inferred = ExtensionFor(asset.ContentType, asset.Kind);
+        if (string.IsNullOrEmpty(extension) || extension.Length > 6)
+            baseName += inferred;
+        else if (asset.Kind == "font" && extension.Equals(".bin", StringComparison.OrdinalIgnoreCase))
+            baseName = Path.ChangeExtension(baseName, inferred);
+
+        if (string.IsNullOrWhiteSpace(baseName))
+            baseName = asset.Kind + inferred;
+
+        var stemName = Path.GetFileNameWithoutExtension(baseName);
+        var extName = Path.GetExtension(baseName);
+        var candidate = baseName;
+        var index = 2;
+        while (!used.Add(candidate))
+        {
+            candidate = $"{stemName}-{index}{extName}";
+            index++;
+        }
+        return candidate;
+    }
+
+    private static string ExtensionFor(string? contentType, string kind)
+    {
+        return contentType?.ToLowerInvariant() switch
+        {
+            "image/jpeg" => ".jpg",
+            "image/png" => ".png",
+            "image/gif" => ".gif",
+            "image/webp" => ".webp",
+            "image/avif" => ".avif",
+            "image/svg+xml" => ".svg",
+            "image/x-icon" or "image/vnd.microsoft.icon" => ".ico",
+            "font/woff2" or "application/font-woff2" => ".woff2",
+            "font/woff" or "application/font-woff" => ".woff",
+            "font/ttf" or "application/x-font-ttf" => ".ttf",
+            "font/otf" or "application/x-font-opentype" => ".otf",
+            "text/css" => ".css",
+            "video/mp4" => ".mp4",
+            "video/webm" => ".webm",
+            _ => kind switch
+            {
+                "font" => ".woff2",
+                "image" => ".img",
+                _ => ".bin"
+            }
+        };
+    }
+
+    private static string Shorten(string url) =>
+        url.Length <= 90 ? url : url[..87] + "…";
+}

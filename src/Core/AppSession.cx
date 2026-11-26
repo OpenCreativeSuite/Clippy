@@ -1,0 +1,1511 @@
+﻿using System.Text.Json;
+using Donkeh.Windowing;
+
+namespace Clippy;
+
+/// <summary>
+/// The single desktop session. It owns browser state, captured components and
+/// the editing workspace. UI components read this object and re-render when
+/// <see cref="Changed"/> fires.
+/// </summary>
+public sealed class AppSession
+{
+    public static readonly JsonSerializerOptions Json = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
+
+    public event Action? Changed;
+
+    public SynchronizationContext? UiContext { get; set; }
+
+    public BrowserState Browser { get; } = new();
+    public List<ComponentEntry> Components { get; } = [];
+    public List<ExtractionWarning> Warnings { get; } = [];
+
+    public bool WorkspaceOpen { get; set; }
+    public string? ActiveComponentId { get; set; }
+    public OutputFormat ActiveFormat { get; set; } = OutputFormat.Html;
+    public string WorkspaceTab { get; set; } = "code";
+    public bool CompareOpen { get; set; }
+    public bool ShowAdvancedDetails { get; set; }
+    public bool ShowAllFormatsExport { get; set; }
+
+    public string PreviewPreset { get; set; } = "Desktop";
+    public int PreviewWidth { get; set; } = 1280;
+    public int PreviewHeight { get; set; } = 800;
+    public double PreviewScale { get; set; } = 0.42;
+
+    public string StatusMessage { get; set; } = "Ready. Open a page and switch on the inspector.";
+    public string StatusTone { get; set; } = "idle";
+    public string? LastExportPath { get; set; }
+    public string? LastExportName { get; set; }
+    public bool ExportNoticeVisible { get; set; }
+
+    public string PreviewUrl { get; set; } = "";
+    public string PreviewDir { get; set; } = "";
+
+    public WebView? WebView { get; private set; }
+    public WebView? PreviewView { get; private set; }
+    public WebView? CompareView { get; private set; }
+
+    private string _lastPageUrl = "";
+    private string _lastAddressInput = "";
+    private int _browserGeneration;
+    private bool _polling;
+    private string? _navGuardUrl;
+    private string? _navPendingUrl;
+    private int _navPendingCount;
+    private System.Threading.Timer? _previewTimer;
+    private readonly object _sync = new();
+    private readonly SemaphoreSlim _extractGate = new(2, 2);
+
+    public static readonly string StartUrl =
+        "data:text/html;charset=utf-8," + Uri.EscapeDataString(StartPage.Html);
+
+    public static readonly AppSession Current = new();
+
+    public AppSession()
+    {
+        Browser.Src = StartUrl;
+        Browser.Address = "";
+        Browser.Url = "";
+        Browser.Title = "New page";
+        _previewTimer = new System.Threading.Timer(_ =>
+        {
+            if (ActiveComponent?.DirtyPreview == true)
+                Post(TickPreviewTimer);
+        }, null, Timeout.Infinite, Timeout.Infinite);
+    }
+
+    public ComponentEntry? ActiveComponent =>
+        Components.FirstOrDefault(c => c.Id == ActiveComponentId);
+
+    public ComponentEntry? SelectedComponent =>
+        Components.FirstOrDefault(c => c.SelectionId == Browser.SelectedSelectionId);
+
+    public IReadOnlyList<ComponentEntry> TopLevelComponents =>
+        Components.Where(c => c.ParentId is null).OrderBy(c => c.Order).ToList();
+
+    public IReadOnlyList<ComponentEntry> ChildrenOf(string componentId) =>
+        Components.Where(c => c.ParentId == componentId).OrderBy(c => c.Order).ToList();
+
+    public void Notify()
+    {
+        var handler = Changed;
+        if (handler is null)
+            return;
+
+        var context = UiContext;
+        if (context is not null && SynchronizationContext.Current != context)
+            context.Post(_ => handler(), null);
+        else
+            handler();
+    }
+
+    public void Post(Action action)
+    {
+        var context = UiContext;
+        if (context is not null && SynchronizationContext.Current != context)
+            context.Post(_ => action(), null);
+        else
+            action();
+    }
+
+    public void SetStatus(string message, string tone = "idle")
+    {
+        Post(() =>
+        {
+            StatusMessage = message;
+            StatusTone = tone;
+            Notify();
+        });
+    }
+
+    // ---------------------------------------------------------------------
+    // Browser
+    // ---------------------------------------------------------------------
+
+    /// <summary>
+    /// Requests a short burst of frames after a webview is attached. Donkeh
+    /// uploads the new texture during its next render pass, so an idle window
+    /// would otherwise keep showing the previous blank frame until the next
+    /// input event arrives.
+    /// </summary>
+    private void KickRepaint()
+    {
+        _ = Task.Run(async () =>
+        {
+            for (var i = 0; i < 4; i++)
+            {
+                await Task.Delay(400);
+                try
+                {
+                    Notify();
+                }
+                catch
+                {
+                }
+            }
+        });
+    }
+
+    /// <summary>
+    /// Applies a scaled page zoom and re-applies it briefly so it survives the
+    /// asynchronous browser creation and the first document load.
+    /// </summary>
+    private static void ApplyZoomSoon(WebView? view, double factor)
+    {
+        if (view is null)
+            return;
+
+        WebViewPaint.SetZoomFactor(view, factor);
+        _ = Task.Run(async () =>
+        {
+            for (var i = 0; i < 12; i++)
+            {
+                await Task.Delay(200);
+                WebViewPaint.SetZoomFactor(view, factor);
+            }
+        });
+    }
+
+    public void AttachWebView(WebView view)
+    {
+        WebView = view;
+        WebViewPaint.Wake(view);
+        NavigationGuard.Attach(view);
+        KickRepaint();
+        _browserGeneration++;
+        SetStatus("Browser ready.", "ok");
+
+        try
+        {
+            var source = InspectorScript.Source;
+            view.ExecuteJavaScript(source);
+            view.Plugins.OnMessage("clippy", msg => { _ = PollBrowserOnceAsync(); });
+            view.Plugins.AddScript(WebViewScript.Preload("clippy-inspector", source, null));
+            view.Plugins.AddScript(WebViewScript.AfterLoad(
+                "clippy-inspector-load",
+                "window.__clippy && window.__clippy.onDocumentLoad && window.__clippy.onDocumentLoad();",
+                null));
+        }
+        catch (Exception ex)
+        {
+            AddWarning("browser", "Could not attach the inspector script: " + ex.Message, "error");
+        }
+
+        _ = PollBrowserLoopAsync(WebView);
+        ApplyBrowserOptions();
+    }
+
+    public void AttachPreviewView(WebView view)
+    {
+        PreviewView = view;
+        WebViewPaint.Wake(view);
+        NavigationGuard.Attach(view);
+        ApplyZoomSoon(view, PreviewScale);
+        KickRepaint();
+        if (!string.IsNullOrEmpty(PreviewUrl))
+        {
+            try { view.Load(PreviewUrl); }
+            catch { }
+        }
+    }
+
+    public void AttachCompareView(WebView view, double scale = 0.5)
+    {
+        CompareView = view;
+        WebViewPaint.Wake(view);
+        NavigationGuard.Attach(view);
+        ApplyZoomSoon(view, scale);
+        KickRepaint();
+        var entry = ActiveComponent;
+        if (entry is null)
+            return;
+
+        _ = Task.Run(async () =>
+        {
+            for (var i = 0; i < 60; i++)
+            {
+                try
+                {
+                    if (view.IsReady && !view.IsLoading && !string.Equals(view.Address, "about:blank", StringComparison.OrdinalIgnoreCase))
+                        break;
+                }
+                catch { }
+                await Task.Delay(200);
+            }
+            await Task.Delay(350);
+            try
+            {
+                var selector = entry.Data?.Selector ?? entry.Selection?.Selector ?? "";
+                if (!string.IsNullOrEmpty(selector))
+                {
+                    var literal = JsonSerializer.Serialize(selector);
+                    await view.EvaluateJavaScriptAsync(
+                        "(function(){var el=document.querySelector(" + literal + ");" +
+                        "if(el){el.scrollIntoView({block:'center',inline:'center'});}})()");
+                }
+            }
+            catch { }
+        });
+    }
+
+    public void Navigate(string input)
+    {
+        var url = NormalizeAddress(input);
+        if (url is null)
+        {
+            SetStatus("That address is not a supported web URL.", "warn");
+            return;
+        }
+
+        Browser.Address = url;
+        Browser.Url = url;
+        _lastAddressInput = url;
+        Browser.Selections.Clear();
+        Browser.SelectedSelectionId = null;
+        AllowNavigation();
+
+        if (WebView is not null && WebView.IsReady)
+        {
+            try
+            {
+                WebView.Load(url);
+                SetStatus("Loading " + url, "busy");
+            }
+            catch (Exception ex)
+            {
+                SetStatus("Navigation failed: " + ex.Message, "error");
+            }
+        }
+        else
+        {
+            Browser.Src = url;
+            _browserGeneration++;
+            SetStatus("Opening " + url, "busy");
+        }
+
+        Notify();
+        KickRepaint();
+    }
+
+    public void OpenHome()
+    {
+        AllowNavigation();
+        Browser.Src = StartUrl;
+        Browser.Address = "";
+        Browser.Url = "";
+        Browser.Selections.Clear();
+        Browser.SelectedSelectionId = null;
+        _browserGeneration++;
+        Notify();
+        KickRepaint();
+
+        if (WebView is not null && WebView.IsReady)
+        {
+            try { WebView.Load(StartUrl); } catch { }
+        }
+    }
+
+    public void Back()
+    {
+        AllowNavigation();
+        try
+        {
+            if (WebView?.IsReady == true && WebView.CanGoBack)
+                WebView.Back();
+        }
+        catch { }
+    }
+
+    public void Forward()
+    {
+        AllowNavigation();
+        try
+        {
+            if (WebView?.IsReady == true && WebView.CanGoForward)
+                WebView.Forward();
+        }
+        catch { }
+    }
+
+    public void Reload()
+    {
+        try
+        {
+            if (WebView?.IsReady == true)
+            {
+                WebView.Reload();
+                SetStatus("Reloading page…", "busy");
+            }
+        }
+        catch { }
+    }
+
+    public void ToggleInspector()
+    {
+        Browser.InspectorActive = !Browser.InspectorActive;
+        ApplyBrowserOptions();
+        SetStatus(Browser.InspectorActive
+            ? "Inspector on. Hover to highlight, click to capture, Shift-click to add, Alt-click for the parent."
+            : "Inspector off. The page is interactive again.", Browser.InspectorActive ? "inspect" : "idle");
+        Notify();
+    }
+
+    public void SetInspector(bool active)
+    {
+        if (Browser.InspectorActive == active)
+            return;
+        Browser.InspectorActive = active;
+        ApplyBrowserOptions();
+        Notify();
+    }
+
+    public void ToggleWorkspace()
+    {
+        if (WorkspaceOpen)
+        {
+            WorkspaceOpen = false;
+            SetStatus("Back in the browser.", "idle");
+        }
+        else
+        {
+            var entry = ActiveComponent ?? Components.FirstOrDefault(c => c.IsReady) ?? Components.FirstOrDefault();
+            if (entry is null)
+            {
+                SetStatus("Capture a component first, then open the workspace.", "warn");
+                return;
+            }
+            OpenWorkspace(entry.Id);
+            return;
+        }
+        Notify();
+    }
+
+    public void OpenWorkspace(string componentId)
+    {
+        var entry = Components.FirstOrDefault(c => c.Id == componentId);
+        if (entry is null)
+            return;
+
+        ActiveComponentId = componentId;
+        WorkspaceOpen = true;
+        if (!string.IsNullOrWhiteSpace(Browser.Url) &&
+            Browser.Url != StartUrl &&
+            (Browser.Url.StartsWith("http", StringComparison.OrdinalIgnoreCase) ||
+             Browser.Url.StartsWith("data:", StringComparison.OrdinalIgnoreCase)))
+        {
+            Browser.Src = Browser.Url;
+        }
+        Browser.SelectedSelectionId = entry.SelectionId;
+        if (entry.Status == CaptureStatus.Pending)
+            _ = ExtractComponentAsync(entry);
+        EnsureFormat(entry);
+        BuildPreview(entry, true);
+        SetStatus("Editing " + entry.Name + ".", "ok");
+        Notify();
+    }
+
+    public void CloseWorkspace()
+    {
+        WorkspaceOpen = false;
+        Notify();
+    }
+
+    public void SetZoom(int percent)
+    {
+        Browser.ZoomPercent = Math.Clamp(percent, 25, 250);
+        ExecuteJs($"__clippy && __clippy.setZoom({(Browser.ZoomPercent / 100.0).ToString(System.Globalization.CultureInfo.InvariantCulture)})");
+        Notify();
+    }
+
+    private void ApplyBrowserOptions()
+    {
+        ExecuteJs($"__clippy && __clippy.setActive({(Browser.InspectorActive ? "true" : "false")})");
+        ExecuteJs($"__clippy && __clippy.setZoom({(Browser.ZoomPercent / 100.0).ToString(System.Globalization.CultureInfo.InvariantCulture)})");
+    }
+
+    public void ExecuteJs(string script)
+    {
+        try
+        {
+            if (WebView?.IsReady == true)
+                WebView.ExecuteJavaScript(script);
+        }
+        catch { }
+    }
+
+    public async Task<string?> EvaluateJsAsync(string script)
+    {
+        try
+        {
+            if (WebView?.IsReady != true)
+                return null;
+            return await WebView.EvaluateJavaScriptAsync(script);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task PollBrowserLoopAsync(WebView view)
+    {
+        if (_polling)
+            return;
+        _polling = true;
+        try
+        {
+            while (ReferenceEquals(view, WebView))
+            {
+                await Task.Delay(420);
+                if (!ReferenceEquals(view, WebView) || !view.IsReady)
+                    continue;
+                await PollBrowserOnceAsync(view);
+            }
+        }
+        catch { }
+        finally
+        {
+            _polling = false;
+        }
+    }
+
+    private async Task PollBrowserOnceAsync(WebView? view = null)
+    {
+        view ??= WebView;
+        if (view is null || !view.IsReady)
+            return;
+
+        if (KeepOnPage(view))
+            return;
+
+        try
+        {
+            var raw = await view.EvaluateJavaScriptAsync(
+                "window.__clippy ? window.__clippy.pageInfo() : null");
+            var json = JsonPayload.Unwrap(raw);
+            if (string.IsNullOrWhiteSpace(json) || json == "null")
+                return;
+
+            var snapshot = JsonSerializer.Deserialize<PageSnapshot>(json, Json);
+            if (snapshot is null)
+                return;
+
+            Post(() => ApplyPageSnapshot(snapshot, view));
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Snaps back when page content starts a navigation. The app calls
+    /// <see cref="AllowNavigation"/> for address-bar loads and history moves, so
+    /// only clicks, scripts and form posts are reverted here.
+    /// </summary>
+    private bool KeepOnPage(WebView view)
+    {
+        try
+        {
+            if (view.IsLoading)
+                return false;
+
+            var address = view.Address;
+            if (string.IsNullOrWhiteSpace(address) ||
+                address.Equals("about:blank", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (SamePage(_navPendingUrl, address))
+                _navPendingCount++;
+            else
+            {
+                _navPendingUrl = address;
+                _navPendingCount = 1;
+            }
+
+            if (_navPendingCount < 2)
+                return false;
+
+            if (_navGuardUrl is null || SamePage(_navGuardUrl, address))
+            {
+                _navGuardUrl = address;
+                return false;
+            }
+
+            var target = _navGuardUrl;
+            _navPendingUrl = null;
+            _navPendingCount = 0;
+            view.Load(target);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void AllowNavigation()
+    {
+        _navGuardUrl = null;
+        _navPendingUrl = null;
+        _navPendingCount = 0;
+    }
+
+    private static bool SamePage(string? a, string? b)
+    {
+        if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b))
+            return string.IsNullOrEmpty(a) && string.IsNullOrEmpty(b);
+        return string.Equals(TrimPage(a), TrimPage(b), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string TrimPage(string url)
+    {
+        var hash = url.IndexOf('#');
+        if (hash >= 0)
+            url = url[..hash];
+        return url.TrimEnd('/');
+    }
+
+    private void ApplyPageSnapshot(PageSnapshot snapshot, WebView view)
+    {
+        var urlChanged = !string.IsNullOrEmpty(_lastPageUrl) &&
+                         !string.Equals(_lastPageUrl, snapshot.Url, StringComparison.Ordinal);
+        var oldTitle = Browser.Title;
+        var oldLoading = Browser.Loading;
+        var oldWidth = Browser.PageWidth;
+        var oldHeight = Browser.PageHeight;
+        var oldInspector = Browser.InspectorActive;
+        var oldSelectionIds = Browser.Selections.Select(s => s.Id).ToHashSet(StringComparer.Ordinal);
+        var liveIds = snapshot.Selections.Select(s => s.Id).ToHashSet(StringComparer.Ordinal);
+        var selectionIdsChanged = !oldSelectionIds.SetEquals(liveIds);
+        _lastPageUrl = snapshot.Url;
+
+        Browser.Url = snapshot.Url;
+        if (!string.IsNullOrWhiteSpace(snapshot.Url) && snapshot.Url != StartUrl)
+            Browser.Address = snapshot.Url;
+        Browser.Title = snapshot.Title;
+        Browser.PageWidth = snapshot.Width;
+        Browser.PageHeight = snapshot.Height;
+        Browser.InspectorActive = snapshot.InspectorActive;
+        Browser.InspectorReady = snapshot.Ready;
+        Browser.Dpr = snapshot.Dpr;
+
+        try
+        {
+            Browser.Loading = view.IsLoading;
+            Browser.CanBack = view.CanGoBack;
+            Browser.CanForward = view.CanGoForward;
+        }
+        catch { }
+
+        var removed = Browser.Selections.Where(s => !liveIds.Contains(s.Id)).ToList();
+        foreach (var old in removed)
+        {
+            Browser.SelectionById.Remove(old.Id);
+            var entry = Components.FirstOrDefault(c => c.SelectionId == old.Id);
+            if (entry is not null)
+            {
+                entry.Selection = null;
+                if (!urlChanged)
+                {
+                    entry.Warnings.RemoveAll(w => w.Code == "selection-removed");
+                    entry.Warnings.Add(new ExtractionWarning
+                    {
+                        Code = "selection-removed",
+                        Message = "This element was removed from the live selection. The captured copy is still available."
+                    });
+                }
+            }
+        }
+
+        Browser.Selections.Clear();
+        foreach (var selection in snapshot.Selections)
+        {
+            Browser.Selections.Add(selection);
+            Browser.SelectionById[selection.Id] = selection;
+            EnsureComponentForSelection(selection);
+        }
+
+        if (Browser.SelectedSelectionId is not null &&
+            !Browser.SelectionById.ContainsKey(Browser.SelectedSelectionId))
+            Browser.SelectedSelectionId = Browser.Selections.LastOrDefault()?.Id;
+
+        if (selectionIdsChanged)
+            RecomputeRelationships();
+
+        var changed = urlChanged || selectionIdsChanged ||
+                      !string.Equals(oldTitle, snapshot.Title, StringComparison.Ordinal) ||
+                      oldLoading != Browser.Loading ||
+                      oldWidth != Browser.PageWidth || oldHeight != Browser.PageHeight ||
+                      oldInspector != Browser.InspectorActive;
+        if (changed)
+            Notify();
+    }
+
+    private void EnsureComponentForSelection(SelectionInfo selection)
+    {
+        var entry = Components.FirstOrDefault(c => c.SelectionId == selection.Id);
+        if (entry is not null)
+        {
+            var changed = entry.Selection is not null &&
+                          (entry.Selection.PathKey != selection.PathKey ||
+                           !string.Equals(entry.Selection.Tag, selection.Tag, StringComparison.Ordinal));
+            entry.Selection = selection;
+            if (changed)
+            {
+                entry.Status = CaptureStatus.Pending;
+                entry.Error = null;
+                entry.CssEdited = false;
+                _ = ExtractComponentAsync(entry);
+            }
+            else if (entry.Status == CaptureStatus.Pending)
+            {
+                _ = ExtractComponentAsync(entry);
+            }
+            return;
+        }
+
+        var name = NameService.Unique(NameService.FromSelection(selection), Components.Select(c => c.Name));
+        entry = new ComponentEntry
+        {
+            SelectionId = selection.Id,
+            Name = name,
+            NameHint = name,
+            Selection = selection,
+            Status = CaptureStatus.Pending,
+            SourceUrl = Browser.Url,
+            PageTitle = Browser.Title,
+            ViewportWidth = Browser.PageWidth,
+            ViewportHeight = Browser.PageHeight,
+            Order = Components.Count
+        };
+        Components.Add(entry);
+        entry.ChildIds.Clear();
+        Browser.SelectedSelectionId = selection.Id;
+        SetStatus("Captured " + name + ". Extracting DOM, CSS and assets…", "busy");
+        _ = ExtractComponentAsync(entry);
+    }
+
+    private void RecomputeRelationships()
+    {
+        foreach (var entry in Components)
+        {
+            entry.ParentId = null;
+            entry.ChildIds.Clear();
+        }
+
+        var ordered = Components
+            .Where(c => c.Selection is not null)
+            .OrderBy(c => c.Selection!.Path.Count)
+            .ThenBy(c => c.Order)
+            .ToList();
+
+        foreach (var child in ordered)
+        {
+            var childPath = child.Selection!.Path;
+            ComponentEntry? bestParent = null;
+            foreach (var candidate in ordered)
+            {
+                if (ReferenceEquals(candidate, child))
+                    continue;
+                var parentPath = candidate.Selection!.Path;
+                if (parentPath.Count == 0 || parentPath.Count >= childPath.Count)
+                    continue;
+                var prefix = true;
+                for (var i = 0; i < parentPath.Count; i++)
+                {
+                    if (parentPath[i].Index != childPath[i].Index ||
+                        parentPath[i].Shadow != childPath[i].Shadow)
+                    {
+                        prefix = false;
+                        break;
+                    }
+                }
+                if (prefix && (bestParent is null || parentPath.Count > bestParent.Selection!.Path.Count))
+                    bestParent = candidate;
+            }
+            if (bestParent is not null)
+            {
+                child.ParentId = bestParent.Id;
+                if (!bestParent.ChildIds.Contains(child.Id))
+                    bestParent.ChildIds.Add(child.Id);
+            }
+        }
+    }
+
+    public void SelectComponent(string componentId)
+    {
+        var entry = Components.FirstOrDefault(c => c.Id == componentId);
+        if (entry is null)
+            return;
+        ActiveComponentId = componentId;
+        if (!string.IsNullOrEmpty(entry.SelectionId))
+            Browser.SelectedSelectionId = entry.SelectionId;
+        Notify();
+    }
+
+    public void RenameComponent(string componentId, string name)
+    {
+        var entry = Components.FirstOrDefault(c => c.Id == componentId);
+        if (entry is null)
+            return;
+        var clean = NameService.Clean(name);
+        if (string.IsNullOrWhiteSpace(clean))
+            return;
+        entry.Name = NameService.Unique(clean, Components.Where(c => c.Id != componentId).Select(c => c.Name));
+        RegenerateAll(entry);
+        Notify();
+    }
+
+    public void RemoveComponent(string componentId)
+    {
+        var entry = Components.FirstOrDefault(c => c.Id == componentId);
+        if (entry is null)
+            return;
+
+        if (!string.IsNullOrEmpty(entry.SelectionId))
+        {
+            ExecuteJs($"__clippy && __clippy.remove({JsonSerializer.Serialize(entry.SelectionId)})");
+            Browser.Selections.RemoveAll(s => s.Id == entry.SelectionId);
+            Browser.SelectionById.Remove(entry.SelectionId);
+        }
+
+        var children = Components.Where(c => c.ParentId == entry.Id).ToList();
+        foreach (var child in children)
+            child.ParentId = null;
+
+        Components.Remove(entry);
+        if (ActiveComponentId == entry.Id)
+            ActiveComponentId = Components.FirstOrDefault(c => c.IsReady)?.Id ?? Components.FirstOrDefault()?.Id;
+
+        for (var i = 0; i < Components.Count; i++)
+            Components[i].Order = i;
+
+        RecomputeRelationships();
+        Notify();
+    }
+
+    public void ClearSelections()
+    {
+        ExecuteJs("__clippy && __clippy.clear()");
+        Browser.Selections.Clear();
+        Browser.SelectionById.Clear();
+        Browser.SelectedSelectionId = null;
+        Notify();
+    }
+
+    public void ClearAllComponents()
+    {
+        ExecuteJs("__clippy && __clippy.clear()");
+        Components.Clear();
+        Browser.Selections.Clear();
+        Browser.SelectionById.Clear();
+        Browser.SelectedSelectionId = null;
+        ActiveComponentId = null;
+        WorkspaceOpen = false;
+        Notify();
+    }
+
+    public void SelectLiveSelection(string selectionId)
+    {
+        Browser.SelectedSelectionId = selectionId;
+        var entry = Components.FirstOrDefault(c => c.SelectionId == selectionId);
+        if (entry is not null)
+            ActiveComponentId = entry.Id;
+        Notify();
+    }
+
+    public void ClimbSelection(string selectionId)
+    {
+        ExecuteJs($"__clippy && __clippy.climb({JsonSerializer.Serialize(selectionId)})");
+        SetStatus("Moved selection to its parent element.", "busy");
+    }
+
+    public void RemoveLiveSelection(string selectionId)
+    {
+        var entry = Components.FirstOrDefault(c => c.SelectionId == selectionId);
+        if (entry is not null)
+            RemoveComponent(entry.Id);
+        else
+        {
+            ExecuteJs($"__clippy && __clippy.remove({JsonSerializer.Serialize(selectionId)})");
+            Browser.Selections.RemoveAll(s => s.Id == selectionId);
+            Browser.SelectionById.Remove(selectionId);
+            Notify();
+        }
+    }
+
+    public void FocusLiveSelection(string selectionId)
+    {
+        ExecuteJs($"__clippy && __clippy.focus({JsonSerializer.Serialize(selectionId)})");
+    }
+
+    public void CaptureDescendant(ComponentEntry entry, int nodeIndex)
+    {
+        if (string.IsNullOrEmpty(entry.SelectionId))
+            return;
+        ExecuteJs("__clippy && __clippy.selectByNodeIndex(" +
+                  JsonSerializer.Serialize(entry.SelectionId) + ", " + nodeIndex + ")");
+        SetStatus("Clipping a descendant element…", "busy");
+    }
+
+    public async void CaptureSelector(string selector, bool openWorkspace = false, OutputFormat? exportFormat = null, bool exposeProperties = false)
+    {
+        try
+        {
+            SetStatus("Waiting for the page before capturing " + selector + "…", "busy");
+            for (var i = 0; i < 120; i++)
+            {
+                if (WebView is not null && WebView.IsReady && !WebView.IsLoading && Browser.InspectorReady)
+                    break;
+                await Task.Delay(250);
+            }
+
+            ExecuteJs("__clippy && __clippy.setActive(true)");
+            var script = "__clippy ? __clippy.selectBySelector(" +
+                         JsonSerializer.Serialize(selector) + ", true) : null";
+            var id = JsonPayload.Unwrap(await EvaluateJsAsync(script));
+            if (string.IsNullOrWhiteSpace(id) || id == "null")
+            {
+                SetStatus("No element matched " + selector + ".", "warn");
+                return;
+            }
+
+            for (var i = 0; i < 120; i++)
+            {
+                var entry = Components.FirstOrDefault(c => c.SelectionId == id && c.IsReady);
+                if (entry is not null)
+                {
+                    if (exposeProperties && entry.Data is not null)
+                    {
+                        entry.ExposeProperties = true;
+                        RegenerateAll(entry);
+                        BuildPreview(entry, true);
+                    }
+                    if (openWorkspace)
+                        OpenWorkspace(entry.Id);
+                    if (exportFormat is not null)
+                        ExportComponent(entry, exportFormat.Value, true);
+                    SetStatus("Captured " + entry.Name + ".", "ok");
+                    return;
+                }
+                await Task.Delay(250);
+            }
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Capture failed: " + ex.Message, "error");
+        }
+    }
+
+    public void MoveComponent(string componentId, int direction)
+    {
+        var entry = Components.FirstOrDefault(c => c.Id == componentId);
+        if (entry is null)
+            return;
+
+        var siblings = Components.Where(c => c.ParentId == entry.ParentId).OrderBy(c => c.Order).ToList();
+        var index = siblings.IndexOf(entry);
+        var target = index + direction;
+        if (target < 0 || target >= siblings.Count)
+            return;
+        (siblings[index], siblings[target]) = (siblings[target], siblings[index]);
+        for (var i = 0; i < siblings.Count; i++)
+            siblings[i].Order = i;
+        Notify();
+    }
+
+    public void PromoteComponent(string componentId)
+    {
+        var entry = Components.FirstOrDefault(c => c.Id == componentId);
+        if (entry is null)
+            return;
+        entry.ParentId = null;
+        RecomputeRelationships();
+        Notify();
+    }
+
+    public void NestComponent(string componentId, string parentId)
+    {
+        var entry = Components.FirstOrDefault(c => c.Id == componentId);
+        var parent = Components.FirstOrDefault(c => c.Id == parentId);
+        if (entry is null || parent is null || entry.Id == parent.Id)
+            return;
+        entry.ParentId = parent.Id;
+        if (!parent.ChildIds.Contains(entry.Id))
+            parent.ChildIds.Add(entry.Id);
+        Notify();
+    }
+
+    // ---------------------------------------------------------------------
+    // Extraction
+    // ---------------------------------------------------------------------
+
+    public async Task ExtractComponentAsync(ComponentEntry entry)
+    {
+        if (entry.Status == CaptureStatus.Extracting)
+            return;
+
+        var selection = entry.Selection ?? Browser.SelectionById.GetValueOrDefault(entry.SelectionId);
+        if (selection is null)
+        {
+            entry.Status = CaptureStatus.Error;
+            entry.Error = "The selected element is no longer available on the page.";
+            Notify();
+            return;
+        }
+
+        await _extractGate.WaitAsync();
+        try
+        {
+            Post(() =>
+            {
+                entry.Status = CaptureStatus.Extracting;
+                entry.Error = null;
+                Notify();
+            });
+
+            var result = await ExtractionService.ExtractAsync(this, entry, selection);
+            Post(() =>
+            {
+                if (result is null)
+                {
+                    entry.Status = CaptureStatus.Error;
+                    entry.Error = "Extraction did not return any data.";
+                }
+                else
+                {
+                    entry.Data = result;
+                    entry.Status = CaptureStatus.Ready;
+                    entry.CssText = result.CssText;
+                    entry.CssEdited = false;
+                    entry.Rules = result.Rules;
+                    entry.Assets = result.Assets;
+                    entry.Warnings = result.Warnings;
+                    entry.SourceUrl = result.SourceUrl;
+                    entry.PageTitle = result.PageTitle;
+                    entry.ViewportWidth = result.ViewportWidth;
+                    entry.ViewportHeight = result.ViewportHeight;
+                    entry.Formats[OutputFormat.React] = new FormatState();
+                    entry.Formats[OutputFormat.Csx] = new FormatState();
+                    entry.Formats[OutputFormat.Html] = new FormatState();
+                    RegenerateAll(entry);
+                    BuildPreview(entry, true);
+                    SetStatus($"Extracted {entry.Name}: {result.NodeCount} elements, {result.Rules.Count} CSS rules, {result.Assets.Count} assets.",
+                        result.Warnings.Any(w => w.Severity == "error") ? "warn" : "ok");
+                }
+                Notify();
+            });
+        }
+        catch (Exception ex)
+        {
+            Post(() =>
+            {
+                entry.Status = CaptureStatus.Error;
+                entry.Error = ex.Message;
+                AddWarning("extract", "Extraction failed for " + entry.Name + ": " + ex.Message, "error");
+                SetStatus("Extraction failed: " + ex.Message, "error");
+            });
+        }
+        finally
+        {
+            _extractGate.Release();
+        }
+    }
+
+    public void RefreshExtraction(string componentId)
+    {
+        var entry = Components.FirstOrDefault(c => c.Id == componentId);
+        if (entry is null)
+            return;
+        entry.Status = CaptureStatus.Pending;
+        entry.Error = null;
+        SetStatus("Refreshing " + entry.Name + " from the live page…", "busy");
+        _ = ExtractComponentAsync(entry);
+    }
+
+    public void RefreshAllFromBrowser()
+    {
+        foreach (var entry in Components)
+        {
+            if (entry.Selection is null)
+                continue;
+            entry.Status = CaptureStatus.Pending;
+            _ = ExtractComponentAsync(entry);
+        }
+        SetStatus("Refreshing every captured component from the live page…", "busy");
+    }
+
+    public void SetExtractionMode(ExtractionMode mode)
+    {
+        var entry = ActiveComponent;
+        if (entry is null)
+            return;
+        entry.Mode = mode;
+        entry.CssEdited = false;
+        entry.CssText = CssGenerator.Build(entry);
+        RegenerateAll(entry);
+        BuildPreview(entry, true);
+        SetStatus("Extraction mode set to " + mode + ".", "ok");
+        Notify();
+    }
+
+    public void SetExposeProperties(bool value)
+    {
+        var entry = ActiveComponent;
+        if (entry is null)
+            return;
+
+        if (value)
+        {
+            var plan = PropertyPlan.Build(entry);
+            if (plan.Items.Count == 0)
+            {
+                entry.ExposeProperties = false;
+                SetStatus("This component has no text, image or link values to expose.", "warn");
+                Notify();
+                return;
+            }
+        }
+
+        entry.ExposeProperties = value;
+        RegenerateAll(entry);
+        BuildPreview(entry, true);
+        SetStatus(value ? "Content properties enabled." : "Using static captured content.", "idle");
+        Notify();
+    }
+
+    public void SetFormat(OutputFormat format)
+    {
+        ActiveFormat = format;
+        EnsureFormat(ActiveComponent);
+        var entry = ActiveComponent;
+        if (entry is not null)
+            BuildPreview(entry, true);
+        Notify();
+    }
+
+    public void SetWorkspaceTab(string tab)
+    {
+        WorkspaceTab = tab;
+        Notify();
+    }
+
+    public void UpdateSource(string text)
+    {
+        var entry = ActiveComponent;
+        if (entry is null)
+            return;
+        var state = entry.Formats[ActiveFormat];
+        state.Source = text;
+        state.Edited = true;
+        SchedulePreview(entry);
+        Notify();
+    }
+
+    public void UpdateCss(string text)
+    {
+        var entry = ActiveComponent;
+        if (entry is null)
+            return;
+        entry.CssText = text;
+        entry.CssEdited = true;
+        SchedulePreview(entry);
+        Notify();
+    }
+
+    public void RegenerateCss()
+    {
+        var entry = ActiveComponent;
+        if (entry is null)
+            return;
+        entry.CssEdited = false;
+        entry.CssText = CssGenerator.Build(entry);
+        BuildPreview(entry, true);
+        SetStatus("Regenerated CSS from the captured rules.", "ok");
+        Notify();
+    }
+
+    public void RegenerateFormat(OutputFormat? format = null)
+    {
+        var entry = ActiveComponent;
+        if (entry is null)
+            return;
+        var target = format ?? ActiveFormat;
+        if (target == OutputFormat.Html)
+        {
+            entry.CssText = entry.Data?.CssText ?? entry.CssText;
+            entry.CssEdited = false;
+        }
+        entry.Formats[target] = new FormatState();
+        GenerationService.GenerateFormat(entry, target);
+        SchedulePreview(entry);
+        SetStatus("Regenerated " + target + " output from the extraction.", "ok");
+        Notify();
+    }
+
+    private void RegenerateAll(ComponentEntry entry)
+    {
+        if (entry.Data is null)
+            return;
+        foreach (var format in Enum.GetValues<OutputFormat>())
+            entry.Formats[format] = new FormatState();
+        foreach (var format in Enum.GetValues<OutputFormat>())
+            GenerationService.GenerateFormat(entry, format);
+        entry.DirtyPreview = true;
+    }
+
+    private void EnsureFormat(ComponentEntry? entry)
+    {
+        if (entry is null || entry.Data is null)
+            return;
+        if (string.IsNullOrEmpty(entry.Formats[ActiveFormat].Source))
+            GenerationService.GenerateFormat(entry, ActiveFormat);
+    }
+
+    public void SetPreviewPreset(string preset)
+    {
+        PreviewPreset = preset;
+        switch (preset)
+        {
+            case "Mobile":
+                PreviewWidth = 390; PreviewHeight = 780; PreviewScale = 0.9;
+                break;
+            case "Tablet":
+                PreviewWidth = 768; PreviewHeight = 900; PreviewScale = 0.62;
+                break;
+            case "Desktop":
+                PreviewWidth = 1280; PreviewHeight = 800; PreviewScale = 0.42;
+                break;
+        }
+        Notify();
+    }
+
+    public void SetCustomViewport(int width, int height)
+    {
+        PreviewPreset = "Custom";
+        PreviewWidth = Math.Clamp(width, 240, 1920);
+        PreviewHeight = Math.Clamp(height, 200, 1600);
+        PreviewScale = 1.0;
+        Notify();
+    }
+
+    public void SetPreviewScale(double scale)
+    {
+        PreviewScale = Math.Clamp(scale, 0.2, 1.5);
+        if (PreviewView is not null)
+            WebViewPaint.SetZoomFactor(PreviewView, PreviewScale);
+        Notify();
+    }
+
+    public void ToggleCompare()
+    {
+        CompareOpen = !CompareOpen;
+        Notify();
+    }
+
+    public void ToggleAdvanced()
+    {
+        ShowAdvancedDetails = !ShowAdvancedDetails;
+        Notify();
+    }
+
+    public void SchedulePreview(ComponentEntry? entry = null)
+    {
+        entry ??= ActiveComponent;
+        if (entry is null)
+            return;
+        entry.DirtyPreview = true;
+        _previewTimer?.Change(420, Timeout.Infinite);
+    }
+
+    public void BuildPreview(ComponentEntry entry, bool reload)
+    {
+        if (entry.Data is null)
+            return;
+        try
+        {
+            var result = PreviewService.WritePreview(this, entry);
+            entry.PreviewDir = result.Directory;
+            entry.PreviewVersion = result.Version;
+            PreviewDir = result.Directory;
+            var url = result.Url;
+            var changed = !string.Equals(PreviewUrl, url, StringComparison.Ordinal);
+            PreviewUrl = url;
+            if (reload)
+            {
+                if (PreviewView is not null && !changed)
+                {
+                    try { PreviewView.Reload(); } catch { }
+                }
+                else if (PreviewView is not null && changed)
+                {
+                    try { PreviewView.Load(url); } catch { }
+                }
+            }
+
+            KickRepaint();
+        }
+        catch (Exception ex)
+        {
+            AddWarning("preview", "Preview could not be built: " + ex.Message, "error");
+        }
+    }
+
+    public void RefreshPreviewNow()
+    {
+        var entry = ActiveComponent;
+        if (entry is null)
+            return;
+        BuildPreview(entry, true);
+        SetStatus("Preview refreshed.", "ok");
+        Notify();
+    }
+
+    public void TickPreviewTimer()
+    {
+        // Called by the workspace timer hook.
+        var entry = ActiveComponent;
+        if (entry is null || !entry.DirtyPreview)
+            return;
+        entry.DirtyPreview = false;
+        BuildPreview(entry, true);
+        Notify();
+    }
+
+    // ---------------------------------------------------------------------
+    // Export
+    // ---------------------------------------------------------------------
+
+    public void ExportActive(OutputFormat format, bool allFormats)
+    {
+        var entry = ActiveComponent;
+        if (entry is null)
+        {
+            SetStatus("There is no component to export.", "warn");
+            return;
+        }
+        ExportComponent(entry, format, allFormats);
+    }
+
+    public void ExportEverything()
+    {
+        if (Components.Count == 0)
+        {
+            SetStatus("Nothing has been captured yet.", "warn");
+            return;
+        }
+
+        try
+        {
+            var root = ExportService.ExportProject(this, Components.Where(c => c.IsReady).ToList());
+            LastExportPath = root;
+            LastExportName = "All components";
+            ExportNoticeVisible = true;
+            SetStatus("Exported " + Components.Count(c => c.IsReady) + " components to " + root, "ok");
+        }
+        catch (Exception ex)
+        {
+            AddWarning("export", "Export failed: " + ex.Message, "error");
+            SetStatus("Export failed: " + ex.Message, "error");
+        }
+        Notify();
+    }
+
+    public void ExportComponent(ComponentEntry entry, OutputFormat format, bool allFormats)
+    {
+        try
+        {
+            var path = ExportService.ExportComponent(this, entry, format, allFormats);
+            LastExportPath = path;
+            LastExportName = entry.Name;
+            ExportNoticeVisible = true;
+            SetStatus("Exported " + entry.Name + " to " + path, "ok");
+        }
+        catch (Exception ex)
+        {
+            AddWarning("export", "Export failed for " + entry.Name + ": " + ex.Message, "error");
+            SetStatus("Export failed: " + ex.Message, "error");
+        }
+        Notify();
+    }
+
+    public void DismissExportNotice()
+    {
+        ExportNoticeVisible = false;
+        Notify();
+    }
+
+    public void OpenExportFolder()
+    {
+        try
+        {
+            var path = LastExportPath;
+            if (string.IsNullOrEmpty(path))
+                path = Path.Combine(ExportService.ExportRoot, "..");
+            if (!string.IsNullOrEmpty(path) && Directory.Exists(path))
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = path,
+                    UseShellExecute = true
+                });
+            }
+            else
+            {
+                SetStatus("No export folder yet.", "warn");
+            }
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Could not open the export folder: " + ex.Message, "warn");
+        }
+    }
+
+    public void AddWarning(string code, string message, string severity = "warning")
+    {
+        Post(() =>
+        {
+            Warnings.Add(new ExtractionWarning { Code = code, Message = message, Severity = severity });
+            if (Warnings.Count > 80)
+                Warnings.RemoveAt(0);
+            Notify();
+        });
+    }
+
+    public static string? NormalizeAddress(string input)
+    {
+        var text = (input ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        if (text.StartsWith("data:", StringComparison.OrdinalIgnoreCase) ||
+            text.StartsWith("about:", StringComparison.OrdinalIgnoreCase))
+            return text;
+
+        if (!text.Contains("://", StringComparison.Ordinal))
+        {
+            var lower = text.ToLowerInvariant();
+            var local = lower.StartsWith("localhost", StringComparison.Ordinal) ||
+                        lower.StartsWith("127.0.0.1", StringComparison.Ordinal) ||
+                        lower.StartsWith("0.0.0.0", StringComparison.Ordinal) ||
+                        lower.StartsWith("[::1]", StringComparison.Ordinal);
+            var looksLikeHost = text.Contains('.') || local;
+            if (!looksLikeHost)
+                return "https://duckduckgo.com/?q=" + Uri.EscapeDataString(text);
+            text = (local ? "http://" : "https://") + text;
+        }
+
+        if (!Uri.TryCreate(text, UriKind.Absolute, out var uri))
+            return null;
+
+        if (uri.Scheme is not ("http" or "https" or "data" or "about"))
+            return null;
+
+        return uri.AbsoluteUri;
+    }
+}
+
+public sealed class BrowserState
+{
+    public string Src { get; set; } = "";
+    public string Address { get; set; } = "";
+    public string Url { get; set; } = "";
+    public string Title { get; set; } = "New page";
+    public bool Loading { get; set; }
+    public bool CanBack { get; set; }
+    public bool CanForward { get; set; }
+    public bool InspectorActive { get; set; }
+    public bool InspectorReady { get; set; }
+    public int ZoomPercent { get; set; } = 100;
+    public int PageWidth { get; set; } = 1280;
+    public int PageHeight { get; set; } = 800;
+    public double Dpr { get; set; } = 1;
+    public string? SelectedSelectionId { get; set; }
+    public List<SelectionInfo> Selections { get; } = [];
+    public Dictionary<string, SelectionInfo> SelectionById { get; } = [];
+}
+
+public static class JsonPayload
+{
+    /// <summary>
+    /// CEF can hand back a JSON string either raw or JSON-encoded depending on
+    /// the build. Normalise both shapes before deserialising.
+    /// </summary>
+    public static string? Unwrap(string? payload)
+    {
+        if (string.IsNullOrWhiteSpace(payload))
+            return null;
+        var text = payload.Trim();
+        if (text.Length >= 2 && text[0] == '"' && text[^1] == '"')
+        {
+            try
+            {
+                var inner = JsonSerializer.Deserialize<string>(text);
+                if (!string.IsNullOrEmpty(inner))
+                    return inner;
+            }
+            catch { }
+        }
+        return text;
+    }
+}
+
+internal static class StartPage
+{
+    public const string Html = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clippy</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    background: #0d1118; color: #e9eef8;
+    font-family: "Segoe UI", system-ui, sans-serif;
+  }
+  .wrap { width: 640px; max-width: 88vw; text-align: center; }
+  .mark {
+    width: 76px; height: 76px; margin: 0 auto 26px; border-radius: 22px;
+    background: linear-gradient(135deg, #7dd3fc, #a78bfa 55%, #f472b6);
+    color: #0b1020; font-size: 38px; font-weight: 800; line-height: 76px;
+    box-shadow: 0 20px 60px rgba(124, 92, 255, 0.35);
+  }
+  h1 { margin: 0 0 10px; font-size: 34px; letter-spacing: -0.02em; }
+  p { margin: 0 auto 28px; max-width: 470px; color: #94a3b8; line-height: 1.55; font-size: 15px; }
+  .steps { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-bottom: 30px; }
+  .step {
+    padding: 9px 13px; border-radius: 999px; border: 1px solid #2b3648;
+    background: #141b26; color: #c7d2e3; font-size: 12px;
+  }
+  .hint { font-size: 12px; color: #64748b; }
+  kbd {
+    display: inline-block; padding: 2px 7px; border-radius: 6px; background: #1b2431;
+    border: 1px solid #303e54; color: #cbd5e1; font-family: Consolas, monospace; font-size: 11px;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="mark">C</div>
+    <h1>Clippy</h1>
+    <p>Paste a page address above, then switch on the inspector. Hover to see the real
+       box model, click to clip the component, and export it as HTML, React or CSX.</p>
+    <div class="steps">
+      <div class="step">1 · Open a page</div>
+      <div class="step">2 · Inspect + click</div>
+      <div class="step">3 · Edit + export</div>
+    </div>
+    <div class="hint">Tip: <kbd>Shift</kbd> + click adds another element. <kbd>Alt</kbd> + click picks the parent.</div>
+  </div>
+</body>
+</html>
+""";
+}

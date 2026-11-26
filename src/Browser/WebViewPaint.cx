@@ -1,0 +1,86 @@
+﻿using System.Reflection;
+using CefSharp;
+using CefSharp.OffScreen;
+using Donkeh.Windowing;
+
+namespace Clippy;
+
+/// <summary>
+/// Nudges an offscreen Chromium webview into producing frames. Donkeh exposes
+/// an engine-neutral WebView controller, but its active browser can still be
+/// null while the tab bridge owns the browser, so this helper resolves the
+/// track through reflection and only asks Chromium to repaint.
+/// </summary>
+public static class WebViewPaint
+{
+    private static readonly System.Reflection.PropertyInfo? BrowserProp =
+        typeof(WebView).Assembly
+            .GetType("Donkeh.Windowing.WebViewHost+WebViewTabTrack")
+            ?.GetProperty("Browser");
+
+    public static void Wake(WebView view, int attempts = 8)
+    {
+        _ = Task.Run(async () =>
+        {
+            for (var i = 0; i < attempts; i++)
+            {
+                try
+                {
+                    var browser = ResolveBrowser(view);
+                    if (browser is not null && browser.IsBrowserInitialized)
+                    {
+                        var host = browser.GetBrowser()?.GetHost();
+                        if (host is not null)
+                        {
+                            host.WasHidden(false);
+                            host.WasResized();
+                            host.Invalidate(PaintElementType.View);
+                        }
+                    }
+                }
+                catch
+                {
+                }
+
+                await Task.Delay(300);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Applies Chromium page zoom, which scales the document while keeping the
+    /// layout viewport equal to <c>elementWidth / factor</c>. This lets a scaled
+    /// preview live in a small element box, so its hit area never covers other
+    /// panes.
+    /// </summary>
+    public static void SetZoomFactor(WebView view, double factor)
+    {
+        try
+        {
+            if (factor <= 0)
+                return;
+            var host = ResolveBrowser(view)?.GetBrowserHost();
+            host?.SetZoomLevel(Math.Log(factor) / Math.Log(1.2));
+        }
+        catch
+        {
+        }
+    }
+
+    private static ChromiumWebBrowser? ResolveBrowser(WebView view)
+    {
+        try
+        {
+            var tab = view.Tabs?.Active;
+            if (tab is null)
+                return null;
+            var bridgeField = tab.GetType().GetField("_bridge", BindingFlags.Instance | BindingFlags.NonPublic);
+            var track = bridgeField?.GetValue(tab);
+            return track is null ? null : BrowserProp?.GetValue(track) as ChromiumWebBrowser;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}

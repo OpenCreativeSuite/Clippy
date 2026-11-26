@@ -1,0 +1,299 @@
+﻿namespace Clippy;
+
+public static class GenerationService
+{
+    public static void GenerateFormat(ComponentEntry entry, OutputFormat format)
+    {
+        if (entry.Data is null)
+            return;
+
+        if (!entry.CssEdited)
+            entry.CssText = CssGenerator.Build(entry);
+
+        var state = entry.Formats[format];
+        if (state.Edited && !string.IsNullOrWhiteSpace(state.Source))
+            return;
+
+        try
+        {
+            state.Source = format switch
+            {
+                OutputFormat.Html => HtmlGenerator.GenerateDocument(entry, entry.CssText),
+                OutputFormat.React => ReactGenerator.Generate(entry),
+                OutputFormat.Csx => CsxGenerator.Generate(entry),
+                _ => ""
+            };
+        }
+        catch (Exception ex)
+        {
+            state.Source = "/* Generation failed: " + ex.Message + " */";
+            entry.Warnings.Add(new ExtractionWarning
+            {
+                Code = "generation",
+                Severity = "error",
+                Message = format + " generation failed: " + ex.Message
+            });
+        }
+    }
+}
+
+public sealed class PreviewBuildResult
+{
+    public string Directory { get; set; } = "";
+    public string Url { get; set; } = "";
+    public string Version { get; set; } = "";
+}
+
+public static class PreviewService
+{
+    public static PreviewBuildResult WritePreview(AppSession session, ComponentEntry entry)
+    {
+        if (entry.Data is null)
+            return new PreviewBuildResult();
+
+        var root = Path.Combine(Path.GetTempPath(), "Clippy", "preview", entry.Id);
+        var assetsDir = Path.Combine(root, "assets");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(assetsDir);
+
+        // Remove stale assets but leave the directory itself.
+        foreach (var file in Directory.GetFiles(assetsDir))
+        {
+            try { File.Delete(file); } catch { }
+        }
+
+        foreach (var asset in entry.Data.Assets)
+        {
+            if (asset.Data is null || string.IsNullOrEmpty(asset.FileName))
+                continue;
+            var path = Path.Combine(assetsDir, asset.FileName);
+            try { File.WriteAllBytes(path, asset.Data); } catch { }
+        }
+
+        var css = entry.CssText;
+        File.WriteAllText(Path.Combine(root, "styles.css"), css);
+
+        var state = entry.Formats[session.ActiveFormat];
+        var source = state.Source;
+        var html = BuildPreviewDocument(entry, css, session.ActiveFormat, source);
+        var indexPath = Path.Combine(root, "index.html");
+        File.WriteAllText(indexPath, html);
+
+        entry.PreviewHtml = html;
+        entry.PreviewCss = css;
+        entry.PreviewDir = root;
+        var version = DateTime.UtcNow.Ticks.ToString();
+        entry.PreviewVersion = version;
+
+        return new PreviewBuildResult
+        {
+            Directory = root,
+            Url = new Uri(indexPath).AbsoluteUri,
+            Version = version
+        };
+    }
+
+    public static string BuildPreviewDocument(ComponentEntry entry, string css, OutputFormat format, string source)
+    {
+        if (format == OutputFormat.Html && !string.IsNullOrWhiteSpace(source) &&
+            LooksLikeDocument(source))
+        {
+            return source;
+        }
+
+        var body = format == OutputFormat.Html
+            ? ExtractBody(source)
+            : StaticPreview.FromComponentSource(source, entry);
+
+        if (string.IsNullOrWhiteSpace(body))
+            body = HtmlGenerator.RenderWithContext(entry);
+
+        var builder = new System.Text.StringBuilder();
+        builder.AppendLine("<!doctype html>");
+        builder.AppendLine("<html lang=\"en\"><head>");
+        builder.AppendLine("<meta charset=\"utf-8\">");
+        builder.AppendLine("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+        builder.AppendLine("<title>" + HtmlEscape.Text(entry.Name) + " preview</title>");
+        builder.AppendLine("<style>");
+        builder.AppendLine("html, body { margin: 0; padding: 0; }");
+        builder.AppendLine("body { background: #ffffff; }");
+        builder.AppendLine("</style>");
+        builder.AppendLine("<style>");
+        builder.AppendLine(css);
+        builder.AppendLine("</style>");
+        builder.AppendLine("</head><body>");
+        builder.AppendLine("<div class=\"clippy-stage\">");
+        builder.AppendLine(body);
+        builder.AppendLine("</div>");
+        builder.AppendLine("</body></html>");
+        return builder.ToString();
+    }
+
+    private static bool LooksLikeDocument(string source) =>
+        source.TrimStart().StartsWith("<!doctype", StringComparison.OrdinalIgnoreCase) ||
+        source.TrimStart().StartsWith("<html", StringComparison.OrdinalIgnoreCase);
+
+    private static string ExtractBody(string source)
+    {
+        if (string.IsNullOrWhiteSpace(source))
+            return "";
+        var lower = source.ToLowerInvariant();
+        var open = lower.IndexOf("<body", StringComparison.Ordinal);
+        if (open >= 0)
+        {
+            var start = source.IndexOf('>', open);
+            var close = lower.LastIndexOf("</body>", StringComparison.Ordinal);
+            if (start >= 0 && close > start)
+                return source[(start + 1)..close];
+        }
+        return source;
+    }
+}
+
+public static class ExportService
+{
+    public static string ExportRoot
+    {
+        get
+        {
+            var docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+            if (string.IsNullOrWhiteSpace(docs))
+                docs = AppContext.BaseDirectory;
+            var root = Path.Combine(docs, "Clippy Exports");
+            Directory.CreateDirectory(root);
+            return root;
+        }
+    }
+
+    public static string ExportComponent(AppSession session, ComponentEntry entry, OutputFormat format, bool allFormats)
+    {
+        var baseDir = Path.Combine(ExportRoot, SafeName(entry.Name));
+        var formats = allFormats ? Enum.GetValues<OutputFormat>() : [format];
+        foreach (var item in formats)
+            WriteFormat(entry, item, baseDir);
+        return baseDir;
+    }
+
+    public static string ExportProject(AppSession session, List<ComponentEntry> components)
+    {
+        var project = ProjectName(session);
+        var root = Path.Combine(ExportRoot, SafeName(project));
+        foreach (var entry in components)
+        {
+            foreach (var format in Enum.GetValues<OutputFormat>())
+                WriteFormat(entry, format, Path.Combine(root, SafeName(entry.Name)));
+        }
+        WriteManifest(root, components, project);
+        return root;
+    }
+
+    private static void WriteFormat(ComponentEntry entry, OutputFormat format, string baseDir)
+    {
+        if (entry.Data is null)
+            return;
+
+        if (string.IsNullOrWhiteSpace(entry.CssText))
+            entry.CssText = CssGenerator.Build(entry);
+        if (string.IsNullOrWhiteSpace(entry.Formats[format].Source))
+            GenerationService.GenerateFormat(entry, format);
+
+        var folder = Path.Combine(baseDir, FormatFolder(format));
+        var assetsDir = Path.Combine(folder, "assets");
+        Directory.CreateDirectory(folder);
+        Directory.CreateDirectory(assetsDir);
+
+        // Remove files from an earlier export so the folder matches this capture.
+        foreach (var stale in Directory.GetFiles(assetsDir))
+        {
+            try { File.Delete(stale); } catch { }
+        }
+
+        var name = NameService.FileName(entry.Name);
+        foreach (var asset in entry.Data.Assets)
+        {
+            if (asset.Data is null || string.IsNullOrEmpty(asset.FileName))
+                continue;
+            var path = Path.Combine(assetsDir, asset.FileName);
+            try { File.WriteAllBytes(path, asset.Data); } catch { }
+        }
+
+        var css = entry.CssText;
+        switch (format)
+        {
+            case OutputFormat.Html:
+                File.WriteAllText(Path.Combine(folder, "index.html"),
+                    HtmlGenerator.GenerateDocument(entry, css));
+                File.WriteAllText(Path.Combine(folder, "styles.css"), css);
+                break;
+            case OutputFormat.React:
+                File.WriteAllText(Path.Combine(folder, name + ".jsx"),
+                    entry.Formats[OutputFormat.React].Source);
+                File.WriteAllText(Path.Combine(folder, name + ".css"), css);
+                File.WriteAllText(Path.Combine(folder, "index.js"),
+                    "export { default } from \"./" + name + "\";\n");
+                break;
+            case OutputFormat.Csx:
+                File.WriteAllText(Path.Combine(folder, name + ".csx"),
+                    entry.Formats[OutputFormat.Csx].Source);
+                File.WriteAllText(Path.Combine(folder, name + ".css"), css);
+                break;
+        }
+
+        WriteManifest(folder, [entry], entry.Name);
+    }
+
+    private static void WriteManifest(string folder, List<ComponentEntry> components, string projectName)
+    {
+        Directory.CreateDirectory(folder);
+        var manifest = new
+        {
+            generator = "Clippy",
+            project = projectName,
+            exportedAt = DateTimeOffset.UtcNow.ToString("O"),
+            components = components.Select(c => new
+            {
+                name = c.Name,
+                source = c.SourceUrl,
+                pageTitle = c.PageTitle,
+                viewport = new { width = c.ViewportWidth, height = c.ViewportHeight },
+                mode = c.Mode.ToString(),
+                assets = c.Data?.Assets.Select(a => new
+                {
+                    url = a.Url,
+                    file = a.LocalPath,
+                    kind = a.Kind,
+                    retrieved = a.LocalPath is not null
+                }),
+                warnings = c.Warnings.Select(w => new { code = w.Code, severity = w.Severity, message = w.Message })
+            })
+        };
+        File.WriteAllText(
+            Path.Combine(folder, "manifest.json"),
+            System.Text.Json.JsonSerializer.Serialize(manifest,
+                new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    public static string FormatFolder(OutputFormat format) => format switch
+    {
+        OutputFormat.React => "react",
+        OutputFormat.Csx => "csx",
+        OutputFormat.Html => "html",
+        _ => "html"
+    };
+
+    private static string ProjectName(AppSession session)
+    {
+        var url = session.Components.FirstOrDefault()?.SourceUrl;
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri) && !string.IsNullOrWhiteSpace(uri.Host))
+            return uri.Host.Replace("www.", "");
+        return "Clippy Project";
+    }
+
+    public static string SafeName(string name)
+    {
+        var clean = NameService.FileName(name);
+        foreach (var invalid in Path.GetInvalidFileNameChars())
+            clean = clean.Replace(invalid, '-');
+        return string.IsNullOrWhiteSpace(clean) ? "Component" : clean;
+    }
+}

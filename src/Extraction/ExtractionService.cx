@@ -1,0 +1,87 @@
+﻿using System.Text.Json;
+
+namespace Clippy;
+
+/// <summary>
+/// Host-side half of extraction: runs the browser collector, resolves
+/// cross-origin stylesheets, downloads assets and builds the portable package.
+/// </summary>
+public static class ExtractionService
+{
+    public static async Task<ExtractedComponent?> ExtractAsync(
+        AppSession session,
+        ComponentEntry entry,
+        SelectionInfo selection)
+    {
+        var options = JsonSerializer.Serialize(new
+        {
+            faithful = entry.Mode == ExtractionMode.Faithful,
+            includeComputed = true
+        });
+
+        ExtractedComponent? extracted = null;
+        var failedSheets = new HashSet<string>(StringComparer.Ordinal);
+
+        for (var pass = 0; pass < 3; pass++)
+        {
+            extracted = await RunCollectorAsync(session, selection, options);
+            if (extracted is null)
+                return null;
+
+            if (extracted.UnreadableSheets.Count == 0)
+                break;
+
+            var injected = await CssFetcher.ResolveAndInjectAsync(session, extracted, failedSheets);
+            if (injected == 0)
+                break;
+        }
+
+        if (extracted is null)
+            return null;
+
+        if (failedSheets.Count > 0)
+        {
+            extracted.Warnings.Add(new ExtractionWarning
+            {
+                Code = "stylesheets-unavailable",
+                Severity = "warning",
+                Message = "Some cross-origin stylesheets could not be retrieved; computed styles fill the gaps where possible."
+            });
+        }        await FontCollector.EnrichAsync(extracted);
+        await ResourceResolver.ResolveAsync(session, extracted);
+        return extracted;
+    }
+
+    private static async Task<ExtractedComponent?> RunCollectorAsync(
+        AppSession session,
+        SelectionInfo selection,
+        string options)
+    {
+        var script = "window.__clippy ? window.__clippy.extract(" +
+                     JsonSerializer.Serialize(selection.Id) + ", " + options + ") : null";
+        var raw = await session.EvaluateJsAsync(script);
+        var json = JsonPayload.Unwrap(raw);
+        if (string.IsNullOrWhiteSpace(json) || json == "null")
+        {
+            session.AddWarning("extract", "The page returned no extraction data. Reload the page and try again.", "error");
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.TryGetProperty("error", out var error))
+            {
+                session.AddWarning("extract", "Browser extraction failed: " + error.GetString(), "error");
+                return null;
+            }
+        }
+        catch (Exception ex)
+        {
+            session.AddWarning("extract", "The extraction payload was not valid JSON: " + ex.Message, "error");
+            return null;
+        }
+
+        return JsonSerializer.Deserialize<ExtractedComponent>(json, AppSession.Json);
+    }
+}

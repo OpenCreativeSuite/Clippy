@@ -1,0 +1,128 @@
+﻿using System.Collections;
+using RefFlags = System.Reflection.BindingFlags;
+using RefField = System.Reflection.FieldInfo;
+using RefProperty = System.Reflection.PropertyInfo;
+using Donkeh.Windowing;
+using HarmonyLib;
+
+namespace Clippy;
+
+/// <summary>
+/// Guards Donkeh's webview frame uploader against a stale-frame race: when a
+/// webview's layout box grows, the engine records the new logical size before
+/// Chromium has produced pixels at that size, and the next upload slices past
+/// the captured frame buffer. Dropping that one stale frame keeps the previous
+/// texture on screen until the fresh paint arrives instead of crashing.
+/// </summary>
+public static class WebViewSafety
+{
+    private sealed class TrackInfo
+    {
+        public RefField? Groups;
+        public RefProperty? Tracks;
+        public RefProperty? HasFrame;
+        public RefProperty? Pixels;
+        public RefProperty? Width;
+        public RefProperty? Height;
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, TrackInfo> Info = new();
+    private static bool _installed;
+
+    public static void Install()
+    {
+        if (_installed)
+            return;
+        _installed = true;
+
+        try
+        {
+            var hostType = AccessTools.TypeByName("Donkeh.Windowing.WebViewHost");
+            if (hostType is null)
+                return;
+
+            var update = AccessTools.Method(hostType, "UpdateFrames");
+            if (update is null)
+                return;
+
+            var prefix = AccessTools.Method(typeof(WebViewSafety), nameof(GuardFrames));
+            if (prefix is null)
+                return;
+
+            new Harmony("clippy.webview-safety").Patch(update, prefix: new HarmonyMethod(prefix));
+            Diag.Log("WebViewSafety installed");
+        }
+        catch (Exception ex)
+        {
+            Diag.Log("WebViewSafety unavailable: " + ex.Message);
+        }
+    }
+
+    private static TrackInfo For(Type type) => Info.GetOrAdd(type, static t => new TrackInfo
+    {
+        Groups = t.GetField("_groups", RefFlags.Instance | RefFlags.NonPublic),
+        Tracks = t.GetProperty("Tracks", RefFlags.Instance | RefFlags.Public),
+        HasFrame = t.GetProperty("HasFrame", RefFlags.Instance | RefFlags.Public),
+        Pixels = t.GetProperty("Pixels", RefFlags.Instance | RefFlags.Public),
+        Width = t.GetProperty("Width", RefFlags.Instance | RefFlags.Public),
+        Height = t.GetProperty("Height", RefFlags.Instance | RefFlags.Public)
+    });
+
+    private static readonly HashSet<string> Noted = new(StringComparer.Ordinal);
+
+    private static void NoteDrop(int width, int height, int bytes)
+    {
+        var key = width + "x" + height + "/" + bytes;
+        lock (Noted)
+        {
+            if (Noted.Count >= 24 || !Noted.Add(key))
+                return;
+        }
+        Diag.Log("WebViewSafety dropped stale frame: box=" + width + "x" + height + " buffer=" + bytes);
+    }
+
+    private static void GuardFrames(object __instance)
+    {
+        try
+        {
+            var groups = For(__instance.GetType()).Groups?.GetValue(__instance) as IDictionary;
+            if (groups is null)
+                return;
+
+            foreach (DictionaryEntry entry in groups)
+            {
+                var group = entry.Value;
+                if (group is null)
+                    continue;
+                var groupInfo = For(group.GetType());
+                if (groupInfo.Tracks?.GetValue(group) is not IEnumerable tracks)
+                    continue;
+
+                foreach (var track in tracks)
+                {
+                    if (track is null)
+                        continue;
+                    var info = For(track.GetType());
+                    if (info.HasFrame?.GetValue(track) is not true)
+                        continue;
+
+                    var pixels = info.Pixels?.GetValue(track) as byte[];
+                    var width = info.Width?.GetValue(track) is int w ? w : 0;
+                    var height = info.Height?.GetValue(track) is int h ? h : 0;
+                    if (pixels is null || width <= 0 || height <= 0)
+                        continue;
+
+                    if (pixels.Length < (long)width * height * 4)
+                    {
+                        info.HasFrame?.SetValue(track, false);
+                        NoteDrop(width, height, pixels.Length);
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Never let the guard interfere with the render loop.
+        }
+    }
+}

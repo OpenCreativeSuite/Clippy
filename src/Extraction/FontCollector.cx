@@ -1,0 +1,228 @@
+﻿using System.Net;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace Clippy;
+
+/// <summary>
+/// Recovers @font-face declarations from the raw stylesheet text. The native
+/// Chromium CSSOM in the embedded browser can drop remote font rules when they
+/// are injected or cross-origin; reading the source text keeps the real font
+/// files in the package.
+/// </summary>
+public static class FontCollector
+{
+    private const long MaxBytes = 8L * 1024 * 1024;
+
+    private static readonly HttpClient Client = new HttpClient(new HttpClientHandler
+    {
+        AutomaticDecompression = DecompressionMethods.All,
+        AllowAutoRedirect = true,
+        MaxAutomaticRedirections = 5
+    })
+    {
+        Timeout = TimeSpan.FromSeconds(20)
+    };
+
+    private static readonly Regex UrlToken = new(
+        @"url\(\s*(?<q>['""]?)(?<url>.*?)\k<q>\s*\)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.Singleline);
+
+    private static readonly Regex FontFamily = new(
+        @"font-family\s*:\s*(?<value>[^;]+)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    public static async Task EnrichAsync(ExtractedComponent component)
+    {
+        var used = new HashSet<string>(component.UsedFontFamilies.Select(NormalizeFamily), StringComparer.OrdinalIgnoreCase);
+        foreach (var font in component.Fonts)
+            used.Add(NormalizeFamily(font.Family));
+        foreach (Match match in FontFamily.Matches(component.CssText ?? ""))
+        {
+            foreach (var family in SplitFamilies(match.Groups["value"].Value))
+                used.Add(NormalizeFamily(family));
+        }
+
+        var texts = new List<(string Text, string Base)>();
+        if (!string.IsNullOrWhiteSpace(component.InlineStyleText))
+            texts.Add((component.InlineStyleText, component.SourceUrl));
+
+        foreach (var href in component.StyleSheetHrefs.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(href) || !href.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                continue;
+            var text = await FetchAsync(href, component.SourceUrl);
+            if (!string.IsNullOrWhiteSpace(text))
+                texts.Add((text, href));
+        }
+
+        var blocks = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (text, baseUrl) in texts)
+        {
+            foreach (var block in ExtractFontFaces(text))
+            {
+                var familyMatch = FontFamily.Match(block);
+                if (!familyMatch.Success)
+                    continue;
+                var families = SplitFamilies(familyMatch.Groups["value"].Value);
+                if (families.Count == 0)
+                    continue;
+                var main = NormalizeFamily(families[0]);
+                if (used.Count > 0 && !used.Contains(main))
+                    continue;
+
+                var normalized = Absolutize(block, baseUrl);
+                var key = main + "|" + Regex.Replace(normalized, @"\s+", " ");
+                if (!seen.Add(key))
+                    continue;
+
+                blocks.Add(normalized);
+                var urls = UrlToken.Matches(normalized)
+                    .Select(m => m.Groups["url"].Value.Trim())
+                    .Where(u => u.Length > 0)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                var font = new CssFontInfo
+                {
+                    Family = families[0],
+                    Weight = Regex.Match(normalized, @"font-weight\s*:\s*([^;]+)").Groups[1].Value.Trim(),
+                    Style = Regex.Match(normalized, @"font-style\s*:\s*([^;]+)").Groups[1].Value.Trim(),
+                    Display = Regex.Match(normalized, @"font-display\s*:\s*([^;]+)").Groups[1].Value.Trim(),
+                    Src = Regex.Match(normalized, @"src\s*:\s*([^;]+)").Groups[1].Value.Trim(),
+                    Urls = urls
+                };
+                if (string.IsNullOrWhiteSpace(font.Weight)) font.Weight = "400";
+                if (string.IsNullOrWhiteSpace(font.Style)) font.Style = "normal";
+                if (string.IsNullOrWhiteSpace(font.Display)) font.Display = "auto";
+                if (!component.Fonts.Any(f => string.Equals(f.Family, font.Family, StringComparison.OrdinalIgnoreCase) &&
+                                              string.Equals(f.Src, font.Src, StringComparison.OrdinalIgnoreCase)))
+                    component.Fonts.Add(font);
+
+                foreach (var url in urls)
+                {
+                    if (component.Assets.Any(a => a.Url == url))
+                        continue;
+                    component.Assets.Add(new AssetRef { Url = url, Kind = "font", Property = "font-face" });
+                }
+            }
+        }
+
+        if (blocks.Count == 0)
+            return;
+
+        var css = component.CssText ?? "";
+        var existing = ExtractFontFaces(css)
+            .Select(b => Regex.Replace(b, @"\s+", " "))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var additions = blocks.Where(b =>
+        {
+            var key = Regex.Replace(b, @"\s+", " ");
+            return !existing.Contains(key);
+        }).ToList();
+        if (additions.Count == 0)
+            return;
+
+        component.CssText = string.Join("\n", additions) + "\n" + css;
+        component.Warnings.RemoveAll(w => w.Code == "font-unresolved");
+    }
+
+    private static async Task<string?> FetchAsync(string url, string referer)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            if (!string.IsNullOrWhiteSpace(referer))
+                request.Headers.Referrer = new Uri(referer);
+            using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            if (!response.IsSuccessStatusCode)
+                return null;
+            if ((response.Content.Headers.ContentLength ?? 0) > MaxBytes)
+                return null;
+            await using var stream = await response.Content.ReadAsStreamAsync();
+            using var buffer = new MemoryStream();
+            var chunk = new byte[64 * 1024];
+            long total = 0;
+            while (true)
+            {
+                var read = await stream.ReadAsync(chunk);
+                if (read == 0)
+                    break;
+                total += read;
+                if (total > MaxBytes)
+                    return null;
+                buffer.Write(chunk, 0, read);
+            }
+            return Encoding.UTF8.GetString(buffer.ToArray());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static List<string> ExtractFontFaces(string css)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrEmpty(css))
+            return result;
+
+        var index = 0;
+        while (true)
+        {
+            var start = css.IndexOf("@font-face", index, StringComparison.OrdinalIgnoreCase);
+            if (start < 0)
+                break;
+            var open = css.IndexOf('{', start);
+            if (open < 0)
+                break;
+            var depth = 0;
+            var end = -1;
+            for (var i = open; i < css.Length; i++)
+            {
+                if (css[i] == '{') depth++;
+                else if (css[i] == '}')
+                {
+                    depth--;
+                    if (depth == 0) { end = i; break; }
+                }
+            }
+            if (end < 0)
+                break;
+            result.Add(css[start..(end + 1)]);
+            index = end + 1;
+        }
+        return result;
+    }
+
+    private static string Absolutize(string block, string baseUrl)
+    {
+        return UrlToken.Replace(block, match =>
+        {
+            var raw = match.Groups["url"].Value.Trim();
+            if (raw.Length == 0 || raw.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                return match.Value;
+            try
+            {
+                var absolute = new Uri(new Uri(baseUrl), raw).AbsoluteUri;
+                return "url(\"" + absolute + "\")";
+            }
+            catch
+            {
+                return match.Value;
+            }
+        });
+    }
+
+    private static List<string> SplitFamilies(string value) =>
+        value.Split(',')
+            .Select(v => v.Trim().Trim('"', '\''))
+            .Where(v => v.Length > 0 && !v.Equals("sans-serif", StringComparison.OrdinalIgnoreCase) &&
+                        !v.Equals("serif", StringComparison.OrdinalIgnoreCase) &&
+                        !v.Equals("monospace", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+    private static string NormalizeFamily(string family) =>
+        family.Trim().Trim('"', '\'').ToLowerInvariant();
+}

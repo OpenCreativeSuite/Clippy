@@ -1,0 +1,111 @@
+﻿namespace Clippy;
+
+/// <summary>
+/// Identifies a small, sensible set of values that can become component
+/// properties. Nothing becomes a property unless the user enables it.
+/// </summary>
+public sealed class PropertyPlan
+{
+    public bool Active { get; set; }
+    public Dictionary<int, string> TextProps { get; } = [];
+    public Dictionary<string, string> AttributeProps { get; } = [];
+    public Dictionary<string, string> Defaults { get; } = [];
+    public List<PropertyInfo> Items { get; } = [];
+
+    public static string TextOf(SerializedNode node) =>
+        string.Join("", node.Children.Where(c => c.Tag == "#text" && !string.IsNullOrWhiteSpace(c.Text)).Select(c => c.Text));
+
+    public static SerializedNode? TextChild(SerializedNode node) =>
+        node.Children.FirstOrDefault(c => c.Tag == "#text" && !string.IsNullOrWhiteSpace(c.Text));
+
+    public static PropertyPlan Build(ComponentEntry entry)
+    {
+        var plan = new PropertyPlan { Active = entry.ExposeProperties };
+        var root = entry.Data?.Root;
+        if (root is null)
+            return plan;
+
+        var nodes = CssGenerator.AllNodes(root).ToList();
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void AddText(SerializedNode node, string name)
+        {
+            if (node is null || string.IsNullOrWhiteSpace(node.Text) || used.Contains(name))
+                return;
+            var text = node.Text.Trim();
+            if (text.Length == 0 || text.Length > 240)
+                return;
+            used.Add(name);
+            plan.TextProps[node.Index] = name;
+            plan.Defaults[name] = text;
+            plan.Items.Add(new PropertyInfo { Name = name, Kind = "text", NodeIndex = node.Index, Default = text });
+        }
+
+        var heading = nodes.FirstOrDefault(n => n.Tag is "h1" or "h2" or "h3" && TextOf(n).Length > 0);
+        if (heading is not null)
+            AddText(TextChild(heading), "Title");
+
+        var paragraph = nodes.FirstOrDefault(n => n.Tag == "p" && TextOf(n).Length > 0 && n.Index != heading?.Index);
+        if (paragraph is not null)
+            AddText(TextChild(paragraph), "Description");
+
+        var priceNode = nodes.FirstOrDefault(n =>
+            n.Attributes.GetValueOrDefault("class", "").Contains("price", StringComparison.OrdinalIgnoreCase) &&
+            TextOf(n).Length > 0);
+        if (priceNode is not null)
+            AddText(TextChild(priceNode), "Price");
+
+        var action = nodes.FirstOrDefault(n =>
+            (n.Tag is "a" or "button") && TextOf(n).Length > 0 &&
+            n.Index != heading?.Index && n.Index != paragraph?.Index);
+        if (action is not null)
+            AddText(TextChild(action), "Label");
+
+        var image = nodes.FirstOrDefault(n => n.Tag == "img" &&
+            !string.IsNullOrWhiteSpace(n.Attributes.GetValueOrDefault("src")));
+        if (image is not null)
+        {
+            var src = image.Attributes["src"];
+            used.Add("ImageSrc");
+            plan.AttributeProps[image.Index + "|src"] = "ImageSrc";
+            plan.Defaults["ImageSrc"] = src;
+            plan.Items.Add(new PropertyInfo { Name = "ImageSrc", Kind = "image", NodeIndex = image.Index, Default = src });
+        }
+
+        var link = nodes.FirstOrDefault(n => n.Tag == "a" &&
+            !string.IsNullOrWhiteSpace(n.Attributes.GetValueOrDefault("href")));
+        if (link is not null && !used.Contains("Href"))
+        {
+            var href = link.Attributes["href"];
+            used.Add("Href");
+            plan.AttributeProps[link.Index + "|href"] = "Href";
+            plan.Defaults["Href"] = href;
+            plan.Items.Add(new PropertyInfo { Name = "Href", Kind = "link", NodeIndex = link.Index, Default = href });
+        }
+
+        if (plan.Items.Count == 0)
+            plan.Active = false;
+
+        return plan;
+    }
+
+    public bool TryText(SerializedNode node, out string name)
+    {
+        name = "";
+        return Active && TextProps.TryGetValue(node.Index, out name!);
+    }
+
+    public bool TryAttribute(SerializedNode node, string attribute, out string name)
+    {
+        name = "";
+        return Active && AttributeProps.TryGetValue(node.Index + "|" + attribute, out name!);
+    }
+}
+
+public sealed class PropertyInfo
+{
+    public string Name { get; set; } = "";
+    public string Kind { get; set; } = "text";
+    public int NodeIndex { get; set; }
+    public string Default { get; set; } = "";
+}

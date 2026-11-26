@@ -1,0 +1,230 @@
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace Clippy;
+
+public static class NameService
+{
+    private static readonly Dictionary<string, string> TagNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["nav"] = "NavigationBar",
+        ["header"] = "Header",
+        ["footer"] = "Footer",
+        ["main"] = "MainSection",
+        ["section"] = "Section",
+        ["article"] = "Article",
+        ["aside"] = "Sidebar",
+        ["form"] = "Form",
+        ["button"] = "Button",
+        ["a"] = "Link",
+        ["input"] = "InputField",
+        ["textarea"] = "TextArea",
+        ["select"] = "Select",
+        ["img"] = "Image",
+        ["picture"] = "Picture",
+        ["video"] = "Video",
+        ["ul"] = "List",
+        ["ol"] = "List",
+        ["li"] = "ListItem",
+        ["table"] = "Table",
+        ["dialog"] = "Dialog",
+        ["h1"] = "Heading",
+        ["h2"] = "Heading",
+        ["h3"] = "Heading",
+        ["h4"] = "Heading",
+        ["h5"] = "Heading",
+        ["h6"] = "Heading",
+        ["p"] = "TextBlock",
+        ["span"] = "Text",
+        ["div"] = "Block",
+        ["figure"] = "Figure",
+        ["label"] = "Label",
+        ["blockquote"] = "Quote"
+    };
+
+    private static readonly HashSet<string> UtilityTokens = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "flex", "grid", "block", "inline", "inline-block", "hidden", "relative", "absolute",
+        "fixed", "sticky", "static", "container", "row", "col", "column", "wrap", "nowrap",
+        "items", "justify", "content", "center", "start", "end", "between", "around", "evenly",
+        "gap", "space", "overflow", "text", "font", "leading", "tracking", "rounded", "shadow",
+        "border", "outline", "ring", "bg", "background", "p", "px", "py", "pt", "pb", "pl", "pr",
+        "m", "mx", "my", "mt", "mb", "ml", "mr", "w", "h", "min", "max", "full", "screen", "auto",
+        "sm", "md", "lg", "xl", "2xl", "dark", "light", "hover", "focus", "active", "disabled",
+        "first", "last", "odd", "even", "group", "peer", "sr", "only", "not", "is", "has",
+        "btn", "button", "link", "anchor", "wrapper", "inner", "outer", "content", "body",
+        "header", "footer", "nav", "main", "section", "article", "list", "item", "row", "cell"
+    };
+
+    private static readonly HashSet<string> WeakNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "div", "container", "wrapper", "inner", "outer", "content", "row", "col", "column",
+        "block", "element", "root", "app", "page", "main", "section", "box", "layout",
+        "flex", "grid", "group", "list", "item", "items", "children", "child", "holder",
+        "component", "svelte", "astro", "react", "css", "jsx", "sc"
+    };
+
+    private static readonly Regex InvalidChars = new("[^A-Za-z0-9]+", RegexOptions.Compiled);
+    private static readonly Regex CssModule = new("^(?=.*[A-Za-z])(?=.*\\d)[A-Za-z0-9_-]{12,}$", RegexOptions.Compiled);
+
+    public static string FromSelection(SelectionInfo selection)
+    {
+        var candidates = new List<string>();
+
+        if (!string.IsNullOrWhiteSpace(selection.DomId))
+            candidates.Add(selection.DomId);
+
+        foreach (var cls in selection.Classes)
+        {
+            if (IsUsefulClass(cls))
+                candidates.Add(cls);
+        }
+
+        if (candidates.Count == 0)
+        {
+            var words = TextWords(selection.Text);
+            if (words.Count > 0)
+                candidates.Add(string.Join(" ", words.Take(3)));
+        }
+
+        foreach (var candidate in candidates)
+        {
+            var clean = Clean(candidate);
+            if (clean.Length > 2 && !WeakNames.Contains(clean))
+                return clean + (NeedsSuffix(candidate, selection) ? TagSuffix(selection.Tag) : "");
+        }
+
+        if (TagNames.TryGetValue(selection.Tag, out var tagName))
+            return tagName;
+
+        return "Component";
+    }
+
+    private static bool NeedsSuffix(string candidate, SelectionInfo selection)
+    {
+        var clean = Clean(candidate);
+        if (TagNames.TryGetValue(selection.Tag, out var tagName) &&
+            string.Equals(clean, tagName, StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (clean.EndsWith("Card", StringComparison.OrdinalIgnoreCase) ||
+            clean.EndsWith("Bar", StringComparison.OrdinalIgnoreCase) ||
+            clean.EndsWith("Section", StringComparison.OrdinalIgnoreCase) ||
+            clean.EndsWith("Box", StringComparison.OrdinalIgnoreCase) ||
+            clean.EndsWith("Panel", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return false;
+    }
+
+    private static string TagSuffix(string tag) => tag switch
+    {
+        "nav" => "Nav",
+        "header" => "Header",
+        "footer" => "Footer",
+        "button" => "Button",
+        "form" => "Form",
+        "section" => "Section",
+        "article" => "Article",
+        "aside" => "Sidebar",
+        "table" => "Table",
+        "dialog" => "Dialog",
+        _ => "Block"
+    };
+
+    private static bool IsUsefulClass(string cls)
+    {
+        if (string.IsNullOrWhiteSpace(cls))
+            return false;
+        if (cls.Length > 42)
+            return false;
+        if (cls.StartsWith("css-", StringComparison.OrdinalIgnoreCase) ||
+            cls.StartsWith("sc-", StringComparison.OrdinalIgnoreCase) ||
+            cls.StartsWith("jsx-", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (CssModule.IsMatch(cls))
+            return false;
+
+        var pieces = cls.Split(['-', '_', ':'], StringSplitOptions.RemoveEmptyEntries);
+        if (pieces.Length == 0)
+            return false;
+        if (pieces.Any(p => UtilityTokens.Contains(p)))
+            return false;
+        if (cls.Contains(':') || cls.Contains('[') || cls.Contains('/'))
+            return false;
+        if (cls.All(char.IsDigit))
+            return false;
+        return true;
+    }
+
+    public static string Clean(string? input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+            return "";
+
+        var text = input.Trim();
+        text = Regex.Replace(text, "([a-z0-9])([A-Z])", "$1 $2");
+        text = text.Replace("_", " ").Replace("-", " ").Replace(".", " ");
+        text = InvalidChars.Replace(text, " ");
+        var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Where(w => !WeakNames.Contains(w))
+            .Take(4)
+            .ToList();
+
+        if (words.Count == 0)
+            return "Component";
+
+        var builder = new StringBuilder();
+        foreach (var word in words)
+        {
+            if (word.Length == 0)
+                continue;
+            var piece = word.Length <= 3 && word.All(char.IsUpper)
+                ? word
+                : char.ToUpperInvariant(word[0]) + word[1..].ToLowerInvariant();
+            builder.Append(piece);
+        }
+
+        var result = builder.ToString();
+        if (result.Length > 0 && char.IsDigit(result[0]))
+            result = "Component" + result;
+        return result.Length > 48 ? result[..48] : result;
+    }
+
+    public static string Unique(string name, IEnumerable<string> existing)
+    {
+        var baseName = Clean(name);
+        if (string.IsNullOrWhiteSpace(baseName))
+            baseName = "Component";
+        var used = existing.Where(n => !string.IsNullOrWhiteSpace(n))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (!used.Contains(baseName))
+            return baseName;
+        for (var i = 2; i < 1000; i++)
+        {
+            var candidate = baseName + i;
+            if (!used.Contains(candidate))
+                return candidate;
+        }
+        return baseName + Guid.NewGuid().ToString("n")[..4];
+    }
+
+    public static string FileName(string name)
+    {
+        var clean = Clean(name);
+        return string.IsNullOrWhiteSpace(clean) ? "Component" : clean;
+    }
+
+    private static List<string> TextWords(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return [];
+        var trimmed = text.Trim();
+        if (trimmed.Length > 60)
+            trimmed = trimmed[..60];
+        var words = Regex.Split(trimmed, "[^A-Za-z0-9]+")
+            .Where(w => w.Length > 1)
+            .Where(w => !UtilityTokens.Contains(w))
+            .Take(4)
+            .ToList();
+        return words;
+    }
+}

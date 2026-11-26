@@ -1,0 +1,63 @@
+﻿using CefSharp;
+using CefSharp.OffScreen;
+
+namespace Clippy;
+
+/// <summary>
+/// Initialises the offscreen Chromium runtime before Donkeh creates its first
+/// webview. Donkeh normally initialises CEF itself, but on some machines the
+/// default GPU-backed startup path fails inside libcef. Clippy boots CEF with
+/// the stable software-offscreen configuration instead, and Donkeh detects the
+/// already-initialised runtime.
+/// </summary>
+public static class CefBoot
+{
+    public static bool Initialized { get; private set; }
+    public static string? Error { get; private set; }
+
+    public static void Initialize()
+    {
+        if (Initialized)
+            return;
+
+        try
+        {
+            var root = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Clippy", "cef");
+            Directory.CreateDirectory(root);
+            Directory.CreateDirectory(Path.Combine(root, "cache"));
+
+            var settings = new CefSettings
+            {
+                CachePath = Path.Combine(root, "cache"),
+                RootCachePath = root,
+                LogFile = Path.Combine(root, "cef.log"),
+                LogSeverity = LogSeverity.Warning,
+                PersistSessionCookies = false,
+                IgnoreCertificateErrors = false
+            };
+
+            settings.CefCommandLineArgs.Add("no-sandbox", "1");
+            settings.CefCommandLineArgs.Add("disable-gpu", "1");
+            settings.CefCommandLineArgs.Add("disable-gpu-compositing", "1");
+            settings.CefCommandLineArgs.Add("disable-dev-shm-usage", "1");
+            settings.CefCommandLineArgs.Add("allow-file-access-from-files", "1");
+            settings.CefCommandLineArgs.Add("disable-backgrounding-occluded-windows", "1");
+            settings.CefCommandLineArgs.Add("disable-renderer-backgrounding", "1");
+            settings.CefCommandLineArgs.Add("disable-background-timer-throttling", "1");
+            settings.WindowlessRenderingEnabled = true;
+            settings.SetOffScreenRenderingBestPerformanceArgs();
+
+            Initialized = Cef.Initialize(settings);
+            Diag.Log("CEF init = " + Initialized);
+            if (!Initialized)
+                Error = "Cef.Initialize returned false.";
+        }
+        catch (Exception ex)
+        {
+            Error = ex.Message;
+            Diag.Log("CEF init failed: " + ex);
+        }
+    }
+}

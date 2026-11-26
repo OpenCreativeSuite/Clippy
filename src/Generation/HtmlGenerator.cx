@@ -1,0 +1,231 @@
+﻿using System.Text;
+
+namespace Clippy;
+
+public static class HtmlGenerator
+{
+    private static readonly HashSet<string> VoidTags = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+        "param", "source", "track", "wbr"
+    };
+
+    private static readonly HashSet<string> SvgVoidTags = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "path", "circle", "ellipse", "line", "polygon", "polyline", "rect", "stop", "use"
+    };
+
+    private static readonly HashSet<string> DroppedAttributes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "srcdoc", "integrity", "crossorigin", "nonce", "ping", "http-equiv",
+        "onload", "onerror", "onclick", "onmouseover", "onfocus", "onblur"
+    };
+
+    public static string GenerateDocument(ComponentEntry entry, string css, bool inlineCss = false, bool preview = false)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("<!doctype html>");
+        builder.AppendLine("<html lang=\"en\">");
+        builder.AppendLine("<head>");
+        builder.AppendLine("<meta charset=\"utf-8\">");
+        builder.AppendLine("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+        builder.AppendLine("<title>" + HtmlEscape.Text(entry.Name) + " - Clippy</title>");
+        if (inlineCss)
+        {
+            builder.AppendLine("<style>");
+            builder.AppendLine(css);
+            builder.AppendLine("</style>");
+        }
+        else
+        {
+            builder.AppendLine("<link rel=\"stylesheet\" href=\"styles.css\">");
+        }
+        builder.AppendLine("<style>");
+        builder.AppendLine("  html, body { margin: 0; padding: 0; }");
+        builder.AppendLine("  body { background: #ffffff; color: #111111; }");
+        builder.AppendLine("  .clippy-stage { display: block; }");
+        builder.AppendLine("  .clippy-stage > * { box-sizing: border-box; }");
+        builder.AppendLine("</style>");
+        builder.AppendLine("</head>");
+        builder.AppendLine("<body>");
+        builder.AppendLine("<div class=\"clippy-stage\">");
+        builder.AppendLine(RenderWithContext(entry));
+        builder.AppendLine("</div>");
+        builder.AppendLine("</body>");
+        builder.AppendLine("</html>");
+        return builder.ToString();
+    }
+
+    public static string RenderWithContext(ComponentEntry entry)
+    {
+        if (entry.Data?.Root is null)
+            return "";
+        var html = RenderNode(entry.Data.Root, isRoot: true, entry.Name);
+        var chain = entry.Data.ContextChain ?? [];
+        for (var i = chain.Count - 1; i >= 0; i--)
+            html = "<div class=\"clippy-context-" + (i + 1) + "\">" + html + "</div>";
+        return html;
+    }
+
+    public static string RenderNode(SerializedNode node, bool isRoot, string componentName)    {
+        var builder = new StringBuilder();
+        RenderNode(node, isRoot, componentName, builder, 0, false);
+        return builder.ToString().TrimEnd();
+    }
+
+    private static void RenderNode(
+        SerializedNode node,
+        bool isRoot,
+        string componentName,
+        StringBuilder builder,
+        int depth,
+        bool inPre)
+    {
+        var indent = new string(' ', depth * 2);
+        var tag = node.Tag;
+        if (string.IsNullOrWhiteSpace(tag))
+            return;
+
+        if (tag == "#text")
+        {
+            builder.Append(HtmlEscape.Text(inPre ? node.Text : CollapseText(node.Text ?? "")));
+            return;
+        }
+
+        var isHtmlOrBody = tag.Equals("html", StringComparison.OrdinalIgnoreCase) ||
+                           tag.Equals("body", StringComparison.OrdinalIgnoreCase);
+        var effectiveTag = isHtmlOrBody ? "div" : tag;
+        var svg = node.IsSvg || node.Attributes.ContainsKey("viewBox") || tag == "svg";
+        var voidTag = !svg && VoidTags.Contains(effectiveTag);
+        var selfClosing = voidTag || (svg && node.Children.Count == 0);
+
+        builder.Append(indent).Append('<').Append(effectiveTag);
+        if (isRoot)
+        {
+            // The scope class lives on the root element itself so rules written
+            // for :root/html/body can target it without an extra wrapper.
+            builder.Append(" class=\"clippy-root");
+            var classes = node.Attributes.GetValueOrDefault("class", "");
+            if (!string.IsNullOrWhiteSpace(classes))
+                builder.Append(' ').Append(HtmlEscape.Attribute(classes));
+            if (node.Fallback || (node.Index > 0 && node.MatchedRules == 0))
+                builder.Append(' ').Append(node.FallbackClass);
+            builder.Append('"');
+        }
+        else
+        {
+            var classes = node.Attributes.GetValueOrDefault("class", "");
+            var extra = node.Fallback || (node.Index > 0 && node.MatchedRules == 0)
+                ? node.FallbackClass
+                : "";
+            if (!string.IsNullOrWhiteSpace(classes) || extra.Length > 0)
+            {
+                builder.Append(" class=\"");
+                builder.Append(HtmlEscape.Attribute(classes));
+                if (extra.Length > 0)
+                {
+                    if (!string.IsNullOrWhiteSpace(classes))
+                        builder.Append(' ');
+                    builder.Append(extra);
+                }
+                builder.Append('"');
+            }
+        }
+
+        foreach (var kv in node.Attributes)
+        {
+            var key = kv.Key;
+            if (key.Equals("class", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (DroppedAttributes.Contains(key))
+                continue;
+            if (key.StartsWith("on", StringComparison.OrdinalIgnoreCase) && key.Length > 2)
+                continue;
+            var value = kv.Value;
+            var lower = key.ToLowerInvariant();
+            if ((lower == "href" || lower == "src" || lower == "action" || lower == "data") &&
+                value.TrimStart().StartsWith("javascript:", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (lower == "id" && isRoot)
+            {
+                // Keep ids, they are useful anchors and pseudo selectors.
+            }
+
+            if (value.Length == 0 || value.Equals("true", StringComparison.OrdinalIgnoreCase))
+                builder.Append(' ').Append(key);
+            else
+                builder.Append(' ').Append(key).Append("=\"").Append(HtmlEscape.Attribute(value)).Append('"');
+        }
+
+        if (selfClosing)
+        {
+            builder.Append(svg ? " />" : ">");
+            builder.AppendLine();
+            return;
+        }
+
+        builder.Append('>');
+
+        var preserveText = inPre || effectiveTag.Equals("pre", StringComparison.OrdinalIgnoreCase) ||
+                           effectiveTag.Equals("textarea", StringComparison.OrdinalIgnoreCase) ||
+                           (node.Computed.GetValueOrDefault("white-space", "").StartsWith("pre", StringComparison.Ordinal));
+
+        var hasElementChildren = node.Children.Any(child => child.Tag != "#text");
+        if (hasElementChildren)
+            builder.AppendLine();
+
+        foreach (var child in node.Children)
+        {
+            if (child.Tag == "#text")
+            {
+                if (hasElementChildren)
+                    builder.Append(new string(' ', (depth + 1) * 2));
+                builder.Append(HtmlEscape.Text(child.Text ?? ""));
+                if (hasElementChildren)
+                    builder.AppendLine();
+                continue;
+            }
+
+            if (hasElementChildren && builder.Length > 0 && builder[^1] != '\n')
+                builder.AppendLine();
+            RenderNode(child, false, componentName, builder, depth + 1, preserveText);
+        }
+
+        if (!hasElementChildren)
+        {
+            // The opening tag and closing tag stay adjacent for inline content.
+        }
+        else if (builder.Length > 0 && builder[^1] != '\n')
+        {
+            builder.AppendLine();
+        }
+        builder.Append(indent).Append("</").Append(effectiveTag).Append('>');
+        builder.AppendLine();
+    }
+
+    private static string CollapseText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return "";
+        return System.Text.RegularExpressions.Regex.Replace(text, @"[ \t\r\n]+", " ").Trim();
+    }
+}
+
+public static class HtmlEscape
+{
+    public static string Text(string? value) =>
+        (value ?? "")
+            .Replace("&", "&amp;")
+            .Replace("<", "&lt;")
+            .Replace(">", "&gt;");
+
+    public static string Attribute(string? value) =>
+        (value ?? "")
+            .Replace("&", "&amp;")
+            .Replace("\"", "&quot;")
+            .Replace("<", "&lt;")
+            .Replace(">", "&gt;");
+
+    public static string JsString(string? value) =>
+        System.Text.Json.JsonSerializer.Serialize(value ?? "");
+}

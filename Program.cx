@@ -1,0 +1,76 @@
+﻿using Donkeh.Hosting;
+using Donkeh.UILab;
+using Donkeh.Windowing;
+using Clippy.Ui;
+
+[assembly: Donkeh.UILab.Stylesheet("src/Styles.css")]
+
+namespace Clippy;
+
+[AppRoot(Width = 1440, Height = 900, Title = "Clippy — Select it. Clip it.")]
+public sealed class App : Component
+{
+    static App()
+    {
+        Diag.Clear();
+        CefBoot.Initialize();
+        WebViewSafety.Install();
+    }
+
+    /// <inheritdoc/>
+    public override Node Render() =>
+        <AppShell />;
+
+    protected override void OnMount()
+    {
+        var args = Environment.GetCommandLineArgs();
+        string? url = null;
+        string? capture = null;
+        string? export = null;
+        string? formatName = null;
+        var openWorkspace = false;
+        var exposeProperties = false;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "--url" && i + 1 < args.Length)
+                url = args[i + 1];
+            else if (args[i].StartsWith("--url=", StringComparison.OrdinalIgnoreCase))
+                url = args[i]["--url=".Length..];
+            else if (args[i] == "--capture" && i + 1 < args.Length)
+                capture = args[i + 1];
+            else if (args[i].StartsWith("--capture=", StringComparison.OrdinalIgnoreCase))
+                capture = args[i]["--capture=".Length..];
+            else if (args[i] == "--workspace")
+                openWorkspace = true;
+            else if (args[i] == "--props")
+                exposeProperties = true;
+            else if (args[i] == "--compare")
+                AppSession.Current.CompareOpen = true;
+            else if (args[i] == "--inspect")
+                AppSession.Current.Browser.InspectorActive = true;
+            else if (args[i] == "--format" && i + 1 < args.Length)
+                formatName = args[i + 1];
+            else if (args[i].StartsWith("--format=", StringComparison.OrdinalIgnoreCase))
+                formatName = args[i]["--format=".Length..];
+            else if (args[i] == "--export" && i + 1 < args.Length)
+                export = args[i + 1];
+            else if (args[i].StartsWith("--export=", StringComparison.OrdinalIgnoreCase))
+                export = args[i]["--export=".Length..];
+        }
+
+        if (!string.IsNullOrWhiteSpace(formatName) && Enum.TryParse<OutputFormat>(formatName, true, out var chosenFormat))
+            AppSession.Current.ActiveFormat = chosenFormat;
+
+        if (!string.IsNullOrWhiteSpace(url))
+            AppSession.Current.Navigate(url);
+
+        if (!string.IsNullOrWhiteSpace(capture))
+        {
+            OutputFormat? format = null;
+            if (!string.IsNullOrWhiteSpace(export) && Enum.TryParse<OutputFormat>(export, true, out var parsed))
+                format = parsed;
+            AppSession.Current.CaptureSelector(capture, openWorkspace, format, exposeProperties);
+        }
+    }
+}

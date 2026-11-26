@@ -1,0 +1,237 @@
+﻿using System.Text;
+using System.Text.RegularExpressions;
+
+namespace Clippy;
+
+/// <summary>
+/// Produces the portable stylesheet for a captured component. Original rules
+/// are kept first; computed-style fallbacks fill holes left by inaccessible
+/// stylesheets or elements with no recoverable rules.
+/// </summary>
+public static class CssGenerator
+{
+    private static readonly string[] RootProperties =
+    [
+        "font-family", "font-size", "font-weight", "font-style",
+        "line-height", "letter-spacing", "color", "text-align",
+        "text-transform", "text-indent", "white-space", "direction", "writing-mode",
+        "visibility", "cursor"
+    ];
+
+    private static readonly string[] FallbackProperties =
+    [
+        "display", "position", "box-sizing", "float", "clear",
+        "margin-top", "margin-right", "margin-bottom", "margin-left",
+        "padding-top", "padding-right", "padding-bottom", "padding-left",
+        "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+        "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
+        "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+        "border-top-left-radius", "border-top-right-radius",
+        "border-bottom-right-radius", "border-bottom-left-radius",
+        "background-color", "background-image", "background-size", "background-position",
+        "background-repeat", "background-clip", "background-origin",
+        "color", "font-family", "font-size", "font-weight", "font-style", "line-height",
+        "letter-spacing", "text-align", "text-transform", "text-decoration-line",
+        "white-space", "overflow-wrap", "word-break", "vertical-align",
+        "flex-direction", "flex-wrap", "justify-content", "align-items", "align-content",
+        "align-self", "flex-grow", "flex-shrink", "flex-basis", "gap", "row-gap", "column-gap",
+        "grid-template-columns", "grid-template-rows", "grid-template-areas",
+        "grid-auto-flow", "grid-auto-columns", "grid-auto-rows",
+        "grid-column-start", "grid-column-end", "grid-row-start", "grid-row-end",
+        "justify-items", "justify-self", "order",
+        "opacity", "overflow-x", "overflow-y", "transform", "transform-origin",
+        "box-shadow", "outline-width", "outline-style", "outline-color", "outline-offset",
+        "object-fit", "clip-path", "mask-image", "mix-blend-mode", "filter",
+        "list-style-type", "list-style-position", "list-style-image",
+        "border-collapse", "border-spacing", "table-layout",
+        "animation-name", "animation-duration", "animation-timing-function",
+        "animation-delay", "animation-iteration-count", "animation-direction",
+        "animation-fill-mode", "transition-property", "transition-duration",
+        "transition-timing-function", "transition-delay"
+    ];
+
+    private static readonly HashSet<string> IgnoredFallbackValues = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "none", "normal", "auto", "0px", "0", "rgba(0, 0, 0, 0)", "transparent",
+        "visible", "static", "row", "nowrap", "stretch", "flex-start", "start",
+        "baseline", "serif", "1", "400", "0s", "ease", "initial", "content-box",
+        "repeat", "0% 0%", "auto auto", "isolate", "source-over", "disc", "outside"
+    };
+
+    public static string Build(ComponentEntry entry)
+    {
+        var data = entry.Data;
+        if (data is null)
+            return entry.CssText;
+
+        var builder = new StringBuilder();
+        builder.AppendLine("/*");
+        builder.AppendLine(" * " + entry.Name + " - captured with Clippy");
+        builder.AppendLine(" * Source: " + (string.IsNullOrWhiteSpace(data.SourceUrl) ? "unknown" : data.SourceUrl));
+        builder.AppendLine(" * Viewport: " + data.ViewportWidth + " - " + data.ViewportHeight + " @ " + data.Dpr.ToString("0.##") + "x");
+        builder.AppendLine(" * " + data.Rules.Count + " recovered rules - " + data.Assets.Count + " resources");
+        if (data.UsedComputedFallback)
+            builder.AppendLine(" * Computed styles supplement the recovered rules where source CSS was unavailable.");
+        builder.AppendLine(" */");
+        builder.AppendLine();
+
+        var rootRule = BuildRootFallback(data);
+        if (rootRule.Length > 0)
+        {
+            builder.AppendLine("/* Base inherited appearance */");
+            builder.AppendLine(".clippy-root {");
+            builder.AppendLine(rootRule);
+            builder.AppendLine("}");
+            builder.AppendLine();
+        }
+
+        var fallbackCss = BuildNodeFallbacks(data);
+        if (fallbackCss.Length > 0)
+        {
+            builder.AppendLine("/* Computed-style fallback */");
+            builder.AppendLine(fallbackCss);
+            builder.AppendLine();
+        }
+
+        if (!string.IsNullOrWhiteSpace(data.CssText))
+        {
+            builder.AppendLine("/* Recovered rules from the source page */");
+            builder.AppendLine(data.CssText.Trim());
+            builder.AppendLine();
+        }
+
+        var css = builder.ToString();
+        return entry.Mode == ExtractionMode.Clean ? CssCleaner.Clean(css) : css;
+    }
+
+    private static string BuildRootFallback(ExtractedComponent data)
+    {
+        var builder = new StringBuilder();
+        foreach (var property in RootProperties)
+        {
+            if (!data.RootComputed.TryGetValue(property, out var value))
+                continue;
+            if (string.IsNullOrWhiteSpace(value) || value == "normal" || value == "none")
+                continue;
+            builder.Append("  ").Append(property).Append(": ").Append(value).AppendLine(";");
+        }
+        return builder.ToString().TrimEnd();
+    }
+
+    private static string BuildNodeFallbacks(ExtractedComponent data)
+    {
+        if (data.Root is null)
+            return "";
+
+        var builder = new StringBuilder();
+        Walk(data.Root, node =>
+        {
+            if (node.Tag == "#text")
+                return;
+            if (!node.Fallback && node.MatchedRules > 0)
+                return;
+
+            var position = node.Computed.GetValueOrDefault("position", "static");
+            var absolute = position is "absolute" or "fixed";
+
+            var declarations = new StringBuilder();
+            foreach (var property in FallbackProperties)
+            {
+                if (!node.Computed.TryGetValue(property, out var value))
+                    continue;
+                if (string.IsNullOrWhiteSpace(value) || IgnoredFallbackValues.Contains(value))
+                    continue;
+                if (!absolute && (property.StartsWith("width") || property.StartsWith("height") ||
+                                  property.StartsWith("min-") || property.StartsWith("max-")))
+                    continue;
+                if (property.StartsWith("animation") || property.StartsWith("transition"))
+                    continue;
+                declarations.Append("  ").Append(property).Append(": ").Append(value).AppendLine(";");
+            }
+
+            if (declarations.Length > 0)
+            {
+                builder.Append('.').Append(node.FallbackClass).AppendLine(" {");
+                builder.Append(declarations);
+                builder.AppendLine("}");
+                builder.AppendLine();
+            }
+
+            AppendPseudo(builder, node);
+        });
+
+        return builder.ToString().TrimEnd();
+    }
+
+    private static void AppendPseudo(StringBuilder builder, SerializedNode node)
+    {
+        AppendPseudo(builder, node, "::before", node.Before);
+        AppendPseudo(builder, node, "::after", node.After);
+    }
+
+    private static void AppendPseudo(StringBuilder builder, SerializedNode node, string name, PseudoCapture? pseudo)
+    {
+        if (pseudo is null || node.Tag == "#text")
+            return;
+        if (string.IsNullOrWhiteSpace(pseudo.Content) || pseudo.Content == "none" || pseudo.Content == "normal")
+            return;
+
+        builder.Append('.').Append(node.FallbackClass).Append(name).AppendLine(" {");
+        builder.Append("  content: ").Append(pseudo.Content).AppendLine(";");
+        foreach (var kv in pseudo.Styles)
+        {
+            if (string.IsNullOrWhiteSpace(kv.Value) || string.Equals(kv.Key, "content", StringComparison.OrdinalIgnoreCase))
+                continue;
+            builder.Append("  ").Append(kv.Key).Append(": ").Append(kv.Value).AppendLine(";");
+        }
+        builder.AppendLine("}");
+        builder.AppendLine();
+    }
+
+    public static void Walk(SerializedNode node, Action<SerializedNode> visit)
+    {
+        visit(node);
+        foreach (var child in node.Children)
+            Walk(child, visit);
+    }
+
+    public static IEnumerable<SerializedNode> AllNodes(SerializedNode root)
+    {
+        yield return root;
+        foreach (var child in root.Children)
+        {
+            foreach (var node in AllNodes(child))
+                yield return node;
+        }
+    }
+
+    public static List<SerializedNode> CollectFallbackNodes(SerializedNode root) =>
+        AllNodes(root).Where(n => n.Fallback || (n.Index > 0 && n.MatchedRules == 0)).ToList();
+}
+
+/// <summary>
+/// Conservative clean-up for generated CSS. It never changes selectors or
+/// declarations that affect the component; it only removes comments, blank
+/// space, empty blocks and duplicate adjacent declarations.
+/// </summary>
+public static class CssCleaner
+{
+    private static readonly Regex Comment = new(@"/\*.*?\*/", RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex EmptyBlock = new(@"\s*\{\s*\}", RegexOptions.Compiled);
+    private static readonly Regex MultiSpace = new(@"[ \t]+", RegexOptions.Compiled);
+
+    public static string Clean(string css)
+    {
+        if (string.IsNullOrWhiteSpace(css))
+            return "";
+
+        var text = Comment.Replace(css, "");
+        text = EmptyBlock.Replace(text, "");
+        text = Regex.Replace(text, @"\r\n|\r", "\n");
+        text = Regex.Replace(text, @"\n{3,}", "\n\n");
+        var lines = text.Split('\n')
+            .Select(line => line.TrimEnd())
+            .Where(line => line.Length > 0);
+        return string.Join("\n", lines).Trim() + "\n";
+    }
+}

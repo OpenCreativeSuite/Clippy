@@ -1,0 +1,32 @@
+using System.Reflection;
+using System.Text;
+
+namespace Clippy;
+
+/// <summary>
+/// Loads the browser-side inspector and extraction script that is injected into
+/// the embedded browser. The script is an embedded resource so Clippy works from
+/// a published build without extra files.
+/// </summary>
+public static class InspectorScript
+{
+    private static string? _cached;
+
+    public static string Source => _cached ??= Load("inspector.js");
+
+    public static string Load(string fileName)
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var names = assembly.GetManifestResourceNames();
+        var match = names.FirstOrDefault(n => n.EndsWith(fileName, StringComparison.OrdinalIgnoreCase));
+        if (match is null)
+            return "/* clippy: missing " + fileName + " */";
+
+        using var stream = assembly.GetManifestResourceStream(match);
+        if (stream is null)
+            return "/* clippy: unreadable " + fileName + " */";
+
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        return reader.ReadToEnd();
+    }
+}
